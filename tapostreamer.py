@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 import tkinter as tk
 from tkinter import ttk
@@ -9,24 +9,31 @@ import time
 import logging
 import sys
 import socket
+import subprocess
+import psutil
 
+# Attempt to import python-vlc for Windows or Linux without hardware acceleration
 try:
     import vlc
 except ImportError:
-    print("ERROR: python-vlc not installed. Run 'pip install python-vlc'")
-    sys.exit(1)
+    if sys.platform.startswith("win"):
+        print("ERROR: python-vlc not installed. Run 'pip install python-vlc'")
+        sys.exit(1)
+    else:
+        print("WARNING: python-vlc not installed. Falling back to VLC CLI if hardware acceleration is enabled.")
 
 # Logging setup
-logging.basicConfig(
-    filename='vlc_errors.log',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-logging.basicConfig(level=logging.WARNING)
+#logging.basicConfig(
+#    filename='vlc_errors.log',
+#    level=logging.DEBUG,
+#    format='%(asctime)s - %(levelname)s - %(message)s'
+#)
 
 class RTSPViewer:
     def __init__(self, root):
+        # Suppress all logging
+        logging.getLogger().setLevel(100)  # Set level above all standard levels
+        
         self.root = root
         self.root.title("Tapo Streamer")
         try:
@@ -41,13 +48,14 @@ class RTSPViewer:
         icon_path = os.path.join(base_path, "cam.png")
         try:
             img = Image.open(icon_path)
-            img_titlebar = img.resize((24, 24), Image.LANCZOS)
+            img_titlebar = img.resize((64, 64), Image.LANCZOS)
             icon = ImageTk.PhotoImage(img_titlebar)
             self.root.iconphoto(True, icon)
         except Exception as e:
             print(f"Error loading icon: {e}")
         self.root.configure(bg="#222222")
         self.root.geometry("2304x1296")
+        self.root.state("normal")  # Ensure window is not maximized
         self.root.minsize(1280, 720)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.cleanup)
@@ -56,6 +64,7 @@ class RTSPViewer:
         self.ips = ["", "", "", ""]
         self.hq_enabled = [True, True, True, True]
         self.audio_enabled = [True, True, True, True]
+        self.use_hardware_acceleration = sys.platform.startswith("linux")  # Default to True on Linux
         self.streams = ["", "", "", ""]
         if sys.platform.startswith("win"):
             config_dir = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "TapoStreamer")
@@ -65,6 +74,7 @@ class RTSPViewer:
         self.config_file = os.path.join(config_dir, "config.json")
         self.vlc_instances = [None] * 4
         self.media_players = [None] * 4
+        self.vlc_processes = [None] * 4  # For VLC CLI on Linux
         self.panels = [None] * 4
         self.labels = [None] * 4
         self.ptz_buttons = []
@@ -102,6 +112,7 @@ class RTSPViewer:
         self.hq_enabled = [True, True, True, True]
         self.audio_enabled = [True, True, True, True]
         self.hide_top_panel_on_launch = False
+        self.use_hardware_acceleration = sys.platform.startswith("linux")
         # Load config if exists
         if os.path.exists(self.config_file):
             try:
@@ -110,13 +121,13 @@ class RTSPViewer:
                 self.username = config.get("username", self.username)
                 self.password = config.get("password", self.password)
                 self.ips = config.get("ips", self.ips)
-                # Ensure hq_enabled is a boolean list
                 self.hq_enabled = [
                     bool(config.get("hq_enabled", self.hq_enabled)[i])
                     for i in range(4)
                 ]
                 self.audio_enabled = config.get("audio_enabled", self.audio_enabled)
                 self.hide_top_panel_on_launch = config.get("hide_top_panel_on_launch", self.hide_top_panel_on_launch)
+                self.use_hardware_acceleration = config.get("use_hardware_acceleration", self.use_hardware_acceleration)
                 logging.info(f"Loaded config from {self.config_file}: {config}")
             except Exception as e:
                 logging.error(f"Failed to load config from {self.config_file}: {e}")
@@ -130,7 +141,8 @@ class RTSPViewer:
             "ips": self.ips,
             "hq_enabled": self.hq_enabled,
             "audio_enabled": self.audio_enabled,
-            "hide_top_panel_on_launch": self.hide_top_panel_on_launch
+            "hide_top_panel_on_launch": self.hide_top_panel_on_launch,
+            "use_hardware_acceleration": self.use_hardware_acceleration
         }
         try:
             with open(self.config_file, "w") as f:
@@ -138,6 +150,20 @@ class RTSPViewer:
             logging.info(f"Saved config to {self.config_file}")
         except Exception as e:
             logging.error(f"Failed to save config to {self.config_file}: {e}")
+
+    def debounce_layout_update(self):
+        self.update_layout()  # Force update on any configure event
+
+    def toggle_top_panel(self, event):
+        if self.top_panel_visible:
+            self.top_panel.pack_forget()
+            self.top_panel_visible = False
+            logging.info("Top panel hidden")
+        else:
+            self.top_panel.pack(side="top", fill="x")
+            self.top_panel_visible = True
+            logging.info("Top panel shown")
+        self.update_layout()
 
     def update_streams(self):
         self.streams = []
@@ -189,6 +215,7 @@ class RTSPViewer:
             draw.line((11, 19, 19, 19), fill="white", width=2)
         return ImageTk.PhotoImage(img)
 
+
     def init_ui(self):
         self.top_panel = tk.Frame(self.root, bg="#222222", height=50)
         if not self.hide_top_panel_on_launch:
@@ -237,24 +264,10 @@ class RTSPViewer:
         self.root.bind("<Configure>", lambda e: self.update_layout())
         self.root.bind("<space>", self.toggle_top_panel)
 
-    def debounce_layout_update(self):
-        self.update_layout()  # Force update on any configure event
-
-    def toggle_top_panel(self, event):
-        if self.top_panel_visible:
-            self.top_panel.pack_forget()
-            self.top_panel_visible = False
-            logging.info("Top panel hidden")
-        else:
-            self.top_panel.pack(side="top", fill="x")
-            self.top_panel_visible = True
-            logging.info("Top panel shown")
-        self.update_layout()
-
     def show_config_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Configure Streams")
-        dialog.geometry("400x450")
+        dialog.geometry("400x500")  # Increased height for new checkbox
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -288,61 +301,81 @@ class RTSPViewer:
             audio_cb.place(x=300, y=100 + i*70)
             audio_checkboxes.append(audio_var)
 
+        # Add hardware acceleration checkbox (Linux only)
+        if sys.platform.startswith("linux"):
+            hw_accel_var = tk.BooleanVar(value=self.use_hardware_acceleration)
+            hw_accel_cb = ttk.Checkbutton(dialog, text="Use Hardware Acceleration (VLC CLI)", variable=hw_accel_var)
+            hw_accel_cb.place(x=20, y=380)
+        else:
+            hw_accel_var = None
+
         hide_panel_var = tk.BooleanVar(value=self.hide_top_panel_on_launch)
         hide_panel_cb = ttk.Checkbutton(dialog, text="Hide options panel on launch", variable=hide_panel_var)
-        hide_panel_cb.place(x=20, y=380)
+        hide_panel_cb.place(x=20, y=410 if sys.platform.startswith("linux") else 380)
 
         tk.Button(
             dialog, text="Save",
             command=lambda: self.save_streams(
                 username_entry, password_entry, ip_entries,
-                hq_checkboxes, audio_checkboxes, hide_panel_var, dialog
+                hq_checkboxes, audio_checkboxes, hw_accel_var, hide_panel_var, dialog
             )
-        ).place(x=150, y=410)
-        tk.Button(dialog, text="Cancel", command=dialog.destroy).place(x=250, y=410)
+        ).place(x=150, y=460 if sys.platform.startswith("linux") else 430)
+        tk.Button(dialog, text="Cancel", command=dialog.destroy).place(x=250, y=460 if sys.platform.startswith("linux") else 430)
 
-    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, hide_panel_var, dialog):
+    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, hw_accel_var, hide_panel_var, dialog):
+        # Update configuration
         self.username = username_entry.get().strip()
         self.password = password_entry.get().strip()
         self.ips = [e.get().strip() for e in ip_entries]
         self.hq_enabled = [v.get() for v in hq_checkboxes]
         self.audio_enabled = [v.get() for v in audio_checkboxes]
         self.hide_top_panel_on_launch = hide_panel_var.get()
+        if hw_accel_var is not None:
+            self.use_hardware_acceleration = hw_accel_var.get()
+
+        # Reset state for streams
         self.onvif_cams = {}
         self.ptz_click_counts = [0] * 4
         self.drop_counts = [0] * 4
         self.drop_timestamps = [[] for _ in range(4)]
         self.update_streams()
         self.save_config()
+
+        # Close dialog and restart streams
         dialog.destroy()
+        logging.info("Configuration saved, restarting streams")
         threading.Thread(target=self.restart_streams, daemon=True).start()
 
     def restart_streams(self):
+        logging.info("Restarting all streams")
+        # Stop all streams
         self.stop_streams()
+        # Update UI to show loading/disabled state
         self.root.after(0, lambda: [
-            self.labels[i].configure(image="", text="Loading Streams...", fg="white") or
+            self.labels[i].configure(image="", text="Disabled" if not self.ips[i] else "Loading...", fg="white") or
             self.fullscreen_buttons[i].place_forget()
             for i in range(4)
         ])
+        # Start streams
         self.start_streams()
+        logging.info("Stream restart completed")
 
     def init_stream(self, index):
-        if not self.ips[index]:
+        if not self.ips[index] or not self.streams[index]:
             self.root.after(0, lambda: self.labels[index].configure(image="", text="Disabled", fg="white"))
             self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
-            logging.info(f"No IP defined for index {index}, marked as Disabled")
+            logging.info(f"No IP or stream URL for index {index}, marked as Disabled")
             return
-        if not self.streams[index]:
-            self.root.after(0, lambda: self.labels[index].configure(image="", text="Disabled", fg="white"))
-            self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
-            logging.warning(f"No stream URL for index {index}")
-            return
+
         logging.info(f"Initializing stream {index}: {self.streams[index]} (HQ={self.hq_enabled[index]})")
         start_time = time.time()
         max_attempts = 3
+        backoff_delay = 1.0
+
         for attempt in range(max_attempts):
             is_final = attempt == max_attempts - 1
             try:
+                # Test network latency
                 ip = self.ips[index]
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -354,156 +387,390 @@ class RTSPViewer:
                     sock.close()
                 except Exception as e:
                     logging.warning(f"Stream {index}: Latency test failed: {e}")
+                    if is_final:
+                        raise RuntimeError("Network unreachable")
 
-                logging.debug(f"WAYLAND_DISPLAY: {os.environ.get('WAYLAND_DISPLAY')}")
-                logging.debug(f"XDG_SESSION_TYPE: {os.environ.get('XDG_SESSION_TYPE')}")
-                instance = vlc.Instance([
-                    '--no-video-title-show',
-                    '--network-caching=3000',
-                    '--audio-resampler=soxr',
-                    '--no-audio-replay-gain',
-                    '--deinterlace=auto',
-                    '--no-drop-late-frames',
-                    '--no-skip-frames',
-                    '--live-caching=3000',
-                    '--vout=wayland',  # or x11 if that works
-                    '--avcodec-hw=vaapi',
-                    '--no-xlib',
-                    '--verbose=2'
-                ])
-                if instance is None:
-                    raise RuntimeError("Failed to create VLC instance")
-                self.vlc_instances[index] = instance
-                player = instance.media_player_new()
-                if player is None:
-                    raise RuntimeError("Failed to create VLC media player")
-                self.media_players[index] = player
-                media = instance.media_new(self.streams[index])
-                media.get_mrl()
-                player.set_media(media)
+                # Get Tkinter window ID
                 try:
-                    hwnd = self.labels[index].winfo_id()
-                    player.set_hwnd(self.labels[index].winfo_id())
-
-
-                    #player.set_xwindow(hwnd)  # Try set_xwindow first
-                    logging.debug(f"Stream {index}: Set XWindow ID {hwnd} (Wayland fallback)")
+                    xid = self.labels[index].winfo_id()
+                    logging.debug(f"Stream {index}: Tkinter XWindow ID {xid}")
                 except Exception as e:
-                    logging.error(f"Stream {index}: Failed to set window ID: {e}")
+                    logging.error(f"Stream {index}: Failed to get window ID: {e}")
+                    raise RuntimeError("Failed to get Tkinter window ID")
 
-                if instance is None:
-                    raise RuntimeError("Failed to create VLC instance")
-                self.vlc_instances[index] = instance
-                player = instance.media_player_new()
-                if player is None:
-                    raise RuntimeError("Failed to create VLC media player")
-                self.media_players[index] = player
-                media = instance.media_new(self.streams[index])
-                media.get_mrl()
-                player.set_media(media)
-                xid = self.labels[index].winfo_id()
-                player.set_xwindow(xid)
-                logging.debug(f"Stream {index}: Set XWindow ID {xid}")
+                if sys.platform.startswith("win") or (sys.platform.startswith("linux") and not self.use_hardware_acceleration):
+                    # Windows or Linux without hardware acceleration: Use python-vlc
+                    try:
+                        instance = vlc.Instance([
+                            '--no-video-title-show',
+                            '--network-caching=5000',
+                            '--deinterlace=auto',
+                            '--no-drop-late-frames',
+                            '--no-skip-frames',
+                            '--live-caching=5000',
+                            '--no-xlib'
+                        ])
+                        if instance is None:
+                            raise RuntimeError("Failed to create VLC instance")
+                        self.vlc_instances[index] = instance
+                        player = instance.media_player_new()
+                        if player is None:
+                            raise RuntimeError("Failed to create VLC media player")
+                        self.media_players[index] = player
+                        media = instance.media_new(self.streams[index])
+                        media.get_mrl()
+                        player.set_media(media)
+                        player.set_xwindow(xid) if sys.platform.startswith("linux") else player.set_hwnd(xid)
+                        player.audio_set_volume(0)  # Start muted
+                        event_manager = player.event_manager()
+                        playing_event = threading.Event()
+                        error_event = threading.Event()
 
-                player.audio_set_volume(0)
-                event_manager = player.event_manager()
-                playing_event = threading.Event()
-                error_event = threading.Event()
-                def on_playing():
-                    logging.debug(f"Stream {index} attempt {attempt+1}/{max_attempts}: Playing event received")
-                    playing_event.set()
-                def on_error():
-                    logging.debug(f"Stream {index} attempt {attempt+1}/{max_attempts}: Error event received")
-                    error_event.set()
-                event_manager.event_attach(vlc.EventType.MediaPlayerPlaying, lambda e: on_playing())
-                event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError, lambda e: on_error())
-                if player.play() == -1:
-                    raise RuntimeError("Failed to start VLC player")
-                logging.debug(f"Stream {index}: Started playback")
-                timeout = 7.0
-                start_wait = time.time()
-                while time.time() - start_wait < timeout:
-                    if playing_event.is_set():
-                        logging.debug(f"Stream {index}: Finalizing setup")
-                        max_attempts = 5
-                        for attempt in range(max_attempts):
-                            time.sleep(0.5)
-                            width, height = player.video_get_size(0) or (0, 0)
-                            if width > 0 and height > 0:
-                                self.frame_shapes[index] = (width, height)
-                                logging.info(f"Stream {index} resolution: {self.frame_shapes[index]}")
+                        def on_playing():
+                            logging.debug(f"Stream {index} attempt {attempt+1}/{max_attempts}: Playing event received")
+                            playing_event.set()
+
+                        def on_error():
+                            logging.debug(f"Stream {index} attempt {attempt+1}/{max_attempts}: Error event received")
+                            error_event.set()
+
+                        event_manager.event_attach(vlc.EventType.MediaPlayerPlaying, lambda e: on_playing())
+                        event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError, lambda e: on_error())
+                        if player.play() == -1:
+                            raise RuntimeError("Failed to start VLC player")
+                        logging.debug(f"Stream {index}: Started playback")
+                        timeout = 7.0
+                        start_wait = time.time()
+                        while time.time() - start_wait < timeout:
+                            if playing_event.is_set():
+                                max_attempts_resolution = 5
+                                for res_attempt in range(max_attempts_resolution):
+                                    time.sleep(0.5)
+                                    width, height = player.video_get_size(0) or (0, 0)
+                                    if width > 0 and height > 0:
+                                        self.frame_shapes[index] = (width, height)
+                                        logging.info(f"Stream {index} resolution: {self.frame_shapes[index]}")
+                                        break
+                                    logging.debug(f"Stream {index}: Attempt {res_attempt+1}/{max_attempts_resolution} to get resolution, got ({width}, {height})")
+                                else:
+                                    self.frame_shapes[index] = (2304, 1296)
+                                    logging.warning(f"Stream {index}: Failed to get resolution, using fallback (2304, 1296)")
+                                player.video_set_scale(0)
+                                self.drop_counts[index] = 0
+                                self.drop_timestamps[index] = []
+                                self.root.after(0, lambda: self.fullscreen_buttons[index].place(relx=1.0, rely=0.0, x=-10, y=10, anchor="ne"))
+                                threading.Thread(target=self.monitor_stream, args=(index, player), daemon=True).start()
+                                return
+                            elif error_event.is_set():
+                                raise RuntimeError("Stream encountered error during playback")
+                            time.sleep(0.1)
+                        raise RuntimeError("Stream failed to start playing within timeout")
+                    except Exception as e:
+                        logging.error(f"Stream {index} python-vlc attempt {attempt+1}/{max_attempts} failed: {e}", exc_info=True)
+                        raise
+                else:
+                    # Linux with hardware acceleration: Use VLC CLI
+                    vlc_cmd = [
+                        'cvlc',
+                        self.streams[index],
+                        '--no-video-title-show',
+                        '--network-caching=2000',
+                        '--live-caching=2000',
+                        '--drop-late-frames',
+                        '--skip-frames',
+                        '--rtsp-tcp',
+                        '--avcodec-hw=any',
+                        f'--drawable-xid={xid}',
+                        '--quiet',
+                        '--alsa-audio-device=default',  # Explicitly set ALSA device
+                        '--no-sout-audio',             # Ensure audio is sent to output
+                        '--gain=1.0',
+                        '--volume=100'                   # Set audio gain to normal
+                    ]
+                    try:
+                        process = subprocess.Popen(
+                            vlc_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            universal_newlines=True
+                        )
+                        self.vlc_processes[index] = process
+                        logging.debug(f"Stream {index}: Started VLC CLI process PID {process.pid}")
+                    except Exception as e:
+                        logging.error(f"Stream {index}: Failed to start VLC CLI: {e}")
+                        raise RuntimeError("Failed to start VLC CLI")
+
+                    timeout = 7.0
+                    start_wait = time.time()
+                    playing = False
+                    while time.time() - start_wait < timeout:
+                        if process.poll() is not None:
+                            stderr = process.stderr.read()
+                            logging.error(f"Stream {index}: VLC CLI exited: {stderr}")
+                            raise RuntimeError("VLC CLI process failed")
+                        try:
+                            proc = psutil.Process(process.pid)
+                            cpu_percent = proc.cpu_percent(interval=0.1)
+                            if cpu_percent > 0:
+                                playing = True
                                 break
-                            logging.debug(f"Stream {index}: Attempt {attempt+1}/{max_attempts} to get resolution, got ({width}, {height})")
-                        else:
-                            self.frame_shapes[index] = (2304, 1296)
-                            logging.warning(f"Stream {index}: Failed to get resolution after {max_attempts} attempts, using fallback (2304, 1296)")
-                        player.video_set_scale(0)
-                        self.drop_counts[index] = 0
-                        self.drop_timestamps[index] = []
-                        self.root.after(0, lambda: self.fullscreen_buttons[index].place(relx=1.0, rely=0.0, x=-10, y=10, anchor="ne"))
-                        threading.Thread(target=self.monitor_stream, args=(index, player), daemon=True).start()
-                        return
-                    elif error_event.is_set():
-                        raise RuntimeError("Stream encountered error during playback")
-                    time.sleep(0.1)
-                raise RuntimeError("Stream failed to start playing within timeout")
+                        except psutil.NoSuchProcess:
+                            logging.error(f"Stream {index}: VLC CLI process vanished")
+                            raise RuntimeError("VLC CLI process vanished")
+                        time.sleep(0.1)
+
+                    if not playing:
+                        process.terminate()
+                        raise RuntimeError("Stream failed to start within timeout")
+
+                    # Mute audio initially (grid view)
+                    if self.audio_enabled[index]:
+                        self._mute_vlc_cli_audio(index)
+                    self.frame_shapes[index] = (2304, 1296)
+                    self.drop_counts[index] = 0
+                    self.drop_timestamps[index] = []
+                    self.root.after(0, lambda: self.fullscreen_buttons[index].place(relx=1.0, rely=0.0, x=-10, y=10, anchor="ne"))
+                    threading.Thread(target=self.monitor_stream, args=(index, None), daemon=True).start()
+                    return
+
             except Exception as e:
-                logging.error(f"Stream {index} attempt {attempt+1}/{max_attempts} failed (hq={self.hq_enabled[index]}): {e}", exc_info=True)
+                logging.error(f"Stream {index} attempt {attempt+1}/{max_attempts} failed (hq={self.hq_enabled[index]}): {e}")
+                # Cleanup
                 if self.media_players[index]:
                     self.media_players[index].stop()
                     self.media_players[index] = None
                 if self.vlc_instances[index]:
                     self.vlc_instances[index].release()
                     self.vlc_instances[index] = None
+                if self.vlc_processes[index]:
+                    try:
+                        self.vlc_processes[index].terminate()
+                        self.vlc_processes[index].wait(timeout=2)
+                        self.vlc_processes[index] = None
+                    except Exception as e:
+                        logging.error(f"Stream {index}: Cleanup failed: {e}")
                 if is_final:
                     break
-                time.sleep(1.0)
+                time.sleep(backoff_delay)
+                backoff_delay *= 2
+
         self.root.after(0, lambda: self.labels[index].configure(image="", text="Stream Failed", fg="white"))
         self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
         logging.error(f"Stream {index} failed after {max_attempts} attempts")
 
+    def _get_vlc_sink_input(self, pid):
+        """Get PulseAudio sink input ID for a given VLC process PID."""
+        try:
+            # Run pactl list sink-inputs and parse output
+            result = subprocess.run(['pactl', 'list', 'sink-inputs'], capture_output=True, text=True, check=True)
+            output = result.stdout
+            current_sink = None
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith('Sink Input #'):
+                    current_sink = line.split('#')[1]
+                elif f'application.process.id = "{pid}"' in line:
+                    logging.debug(f"Found sink input {current_sink} for PID {pid}")
+                    return current_sink
+            logging.debug(f"No sink input found for PID {pid}")
+            return None
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to get sink input for PID {pid}: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error querying PulseAudio sink inputs for PID {pid}: {e}")
+            return None
+
+    def _mute_vlc_cli_audio(self, index):
+        """Mute the audio for a VLC CLI process and set volume to 0."""
+        if not self.vlc_processes[index]:
+            logging.warning(f"Stream {index}: No VLC process to mute")
+            return
+        pid = self.vlc_processes[index].pid
+        sink_input = self._get_vlc_sink_input(pid)
+        if sink_input:
+            try:
+                # Mute the sink input
+                subprocess.run(['pactl', 'set-sink-input-mute', sink_input, '1'], check=True)
+                # Set volume to 0
+                subprocess.run(['pactl', 'set-sink-input-volume', sink_input, '0%'], check=True)
+                logging.info(f"Stream {index} (PID {pid}): Muted and set volume to 0% (sink input {sink_input})")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Stream {index} (PID {pid}): Failed to mute or set volume (sink input {sink_input}): {e}")
+        else:
+            logging.warning(f"Stream {index} (PID {pid}): No sink input found, audio not muted")
+
+    def _unmute_vlc_cli_audio(self, index):
+        """Unmute the audio for a VLC CLI process and set volume to 100%."""
+        if not self.vlc_processes[index]:
+            logging.warning(f"Stream {index}: No VLC process to unmute")
+            return
+        pid = self.vlc_processes[index].pid
+        max_attempts = 5
+        retry_delay = 0.5  # Seconds between retries
+
+        for attempt in range(max_attempts):
+            sink_input = self._get_vlc_sink_input(pid)
+            if sink_input:
+                try:
+                    # Unmute the sink input
+                    subprocess.run(['pactl', 'set-sink-input-mute', sink_input, '0'], check=True)
+                    # Set volume to 100% (65536)
+                    subprocess.run(['pactl', 'set-sink-input-volume', sink_input, '100%'], check=True)
+                    logging.info(f"Stream {index} (PID {pid}): Unmuted and set volume to 100% (sink input {sink_input}, attempt {attempt+1})")
+                    return
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Stream {index} (PID {pid}): Failed to unmute or set volume (sink input {sink_input}, attempt {attempt+1}): {e}")
+                    return
+            logging.debug(f"Stream {index} (PID {pid}): Sink input not found, attempt {attempt+1}/{max_attempts}")
+            if attempt < max_attempts - 1:
+                time.sleep(retry_delay)
+
+        logging.error(f"Stream {index} (PID {pid}): Failed to unmute or set volume after {max_attempts} attempts, no sink input found")
+
     def monitor_stream(self, index, player):
         last_check = time.time()
-        while self.running and self.media_players[index]:
+        failure_count = 0
+        max_failures = 3
+        backoff_delay = 15.0
+        last_stream_switch = 0
+
+        while self.running and (self.media_players[index] or self.vlc_processes[index]):
             try:
-                state = player.get_state()
-                if state in (vlc.State.Ended, vlc.State.Error):
-                    logging.error(f"Stream {index} stopped: {state}")
-                    self.root.after(0, lambda: self.labels[index].configure(image="", text="Stream Failed", fg="white"))
-                    self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
-                    break
                 current_time = time.time()
-                if current_time - last_check >= 1.0:
-                    if player.get_state() == vlc.State.Buffering:
-                        self.drop_counts[index] += 1
-                        self.drop_timestamps[index].append(current_time)
-                        logging.debug(f"Stream {index} drop detected (buffering), count: {self.drop_counts[index]}")
-                    self.drop_timestamps[index] = [t for t in self.drop_timestamps[index] if current_time - t < 5.0]
-                    if len(self.drop_timestamps[index]) >= 10 and self.hq_enabled[index]:
-                        logging.warning(f"Stream {index} excessive drops ({len(self.drop_timestamps[index])} in 5s), switching to stream2")
-                        self.hq_enabled[index] = False
-                        self.update_streams()
-                        self.save_config()
-                        player.stop()
+                if sys.platform.startswith("win") or (sys.platform.startswith("linux") and not self.use_hardware_acceleration):
+                    # Python-vlc monitoring
+                    if player is None:
+                        break
+                    state = player.get_state()
+                    if state in (vlc.State.Ended, vlc.State.Error):
+                        logging.error(f"Stream {index} stopped: {state}")
+                        self.root.after(0, lambda: self.labels[index].configure(image="", text="Stream Failed", fg="white"))
+                        self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
+                        break
+                    if current_time - last_check >= 1.0:
+                        if player.get_state() == vlc.State.Buffering:
+                            self.drop_counts[index] += 1
+                            self.drop_timestamps[index].append(current_time)
+                            logging.debug(f"Stream {index} drop detected (buffering), count: {self.drop_counts[index]}")
+                else:
+                    # VLC CLI monitoring
+                    if self.vlc_processes[index] is None:
+                        break
+                    if self.vlc_processes[index].poll() is not None:
+                        logging.error(f"Stream {index} VLC CLI process terminated")
+                        self.root.after(0, lambda: self.labels[index].configure(image="", text="Stream Failed", fg="white"))
+                        self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
+                        break
+                    if current_time - last_check >= 4.0:
+                        try:
+                            proc = psutil.Process(self.vlc_processes[index].pid)
+                            cpu_percent = proc.cpu_percent(interval=0.1)
+                            if cpu_percent == 0:
+                                self.drop_counts[index] += 1
+                                self.drop_timestamps[index].append(current_time)
+                                logging.debug(f"Stream {index} drop detected (no CPU activity), count: {self.drop_counts[index]}")
+                        except psutil.NoSuchProcess:
+                            logging.error(f"Stream {index}: VLC CLI process vanished")
+                            break
+
+                self.drop_timestamps[index] = [t for t in self.drop_timestamps[index] if current_time - t < 5.0]
+                if len(self.drop_timestamps[index]) >= 10 and self.hq_enabled[index]:
+                    if current_time - last_stream_switch < 60.0:
+                        logging.warning(f"Stream {index} switch throttled (last switch {current_time - last_stream_switch:.1f}s ago)")
+                        self.root.after(0, lambda: self.labels[index].configure(image="", text="Waiting: Stream Unstable", fg="white"))
+                        time.sleep(backoff_delay)
+                        backoff_delay = min(backoff_delay * 2, 120.0)
+                        continue
+
+                    logging.warning(f"Stream {index} excessive drops ({len(self.drop_timestamps[index])} in 5s), switching to stream2")
+                    self.hq_enabled[index] = False
+                    self.update_streams()
+                    self.save_config()
+                    failure_count += 1
+                    last_stream_switch = current_time
+
+                    # Cleanup
+                    if self.media_players[index]:
+                        self.media_players[index].stop()
                         self.media_players[index] = None
+                    if self.vlc_instances[index]:
                         self.vlc_instances[index].release()
                         self.vlc_instances[index] = None
-                        self.root.after(0, lambda: self.labels[index].configure(image="", text="Loading...", fg="white"))
-                        self.init_stream(index)
-                        return
-                    last_check = current_time
-                time.sleep(0.5)
+                    if self.vlc_processes[index]:
+                        try:
+                            self.vlc_processes[index].terminate()
+                            if self.running:  # Only wait if app is still running
+                                self.vlc_processes[index].wait(timeout=5)
+                            logging.info(f"Terminated VLC CLI process {index} during stream switch")
+                        except subprocess.TimeoutExpired:
+                            logging.warning(f"VLC CLI process {index} did not terminate within 5 seconds during stream switch, sending SIGKILL")
+                            self.vlc_processes[index].kill()
+                            try:
+                                self.vlc_processes[index].wait(timeout=1)
+                                logging.info(f"VLC CLI process {index} killed during stream switch")
+                            except subprocess.TimeoutExpired:
+                                logging.error(f"VLC CLI process {index} could not be killed during stream switch")
+                        except Exception as e:
+                            logging.error(f"Error terminating VLC CLI process {index} during stream switch: {e}")
+                        self.vlc_processes[index] = None
+
+                    self.root.after(0, lambda: self.labels[index].configure(image="", text="Loading...", fg="white"))
+
+                    if failure_count >= max_failures:
+                        logging.error(f"Stream {index} failed {failure_count} times, pausing for {backoff_delay}s")
+                        self.root.after(0, lambda: self.labels[index].configure(image="", text="Paused: Stream Unstable", fg="white"))
+                        time.sleep(backoff_delay)
+                        backoff_delay = min(backoff_delay * 2, 120.0)
+                        failure_count = 0
+                        self.drop_counts[index] = 0
+                        self.drop_timestamps[index] = []
+                        continue
+
+                    self.init_stream(index)
+                    return
+
+                last_check = current_time
+                time.sleep(2.0 if self.vlc_processes[index] else 0.5)
             except Exception as e:
                 logging.error(f"Error monitoring stream {index}: {e}")
                 self.root.after(0, lambda: self.labels[index].configure(image="", text="Stream Failed", fg="white"))
                 self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget() if self.fullscreen_buttons[index] else None)
                 break
+
+        # Final cleanup (suppress TimeoutExpired during shutdown)
         if self.media_players[index]:
-            self.media_players[index].stop()
+            try:
+                self.media_players[index].stop()
+                logging.info(f"Stopped media player {index}")
+            except Exception as e:
+                logging.error(f"Error stopping media player {index}: {e}")
             self.media_players[index] = None
         if self.vlc_instances[index]:
-            self.vlc_instances[index].release()
+            try:
+                self.vlc_instances[index].release()
+                logging.info(f"Released VLC instance {index}")
+            except Exception as e:
+                logging.error(f"Error releasing VLC instance {index}: {e}")
             self.vlc_instances[index] = None
+        if self.vlc_processes[index]:
+            try:
+                pid = self.vlc_processes[index].pid
+                self.vlc_processes[index].terminate()
+                if self.running:  # Only wait if app is still running
+                    self.vlc_processes[index].wait(timeout=5)
+                logging.info(f"Terminated VLC CLI process {index} (PID {pid})")
+            except subprocess.TimeoutExpired:
+                logging.warning(f"VLC CLI process {index} (PID {pid}) did not terminate within 5 seconds, sending SIGKILL")
+                self.vlc_processes[index].kill()
+                try:
+                    self.vlc_processes[index].wait(timeout=1)
+                    logging.info(f"VLC CLI process {index} (PID {pid}) killed")
+                except subprocess.TimeoutExpired:
+                    logging.error(f"VLC CLI process {index} (PID {pid}) could not be killed")
+            except Exception as e:
+                logging.error(f"Error terminating VLC CLI process {index}: {e}")
+            self.vlc_processes[index] = None
         logging.info(f"Stream {index} terminated")
 
     def start_streams(self):
@@ -514,6 +781,10 @@ class RTSPViewer:
             if self.vlc_instances[i]:
                 self.vlc_instances[i].release()
                 self.vlc_instances[i] = None
+            if self.vlc_processes[i]:
+                self.vlc_processes[i].terminate()
+                self.vlc_processes[i].wait(timeout=2)
+                self.vlc_processes[i] = None
             text = "Disabled" if not self.ips[i] else "Loading..."
             self.root.after(0, lambda idx=i, txt=text: self.labels[idx].configure(image="", text=txt, fg="white"))
         threads = []
@@ -522,42 +793,60 @@ class RTSPViewer:
                 thread = threading.Thread(target=self.init_stream, args=(i,), daemon=True)
                 threads.append(thread)
                 thread.start()
-        # Wait for all threads to complete (optional, ensures layout updates after initialization)
         for thread in threads:
             thread.join()
         for i in range(4):
-            if self.media_players[i]:
+            if self.media_players[i] or self.vlc_processes[i]:
                 self.root.after(0, lambda idx=i: self.update_target_dims(idx))
 
-    def restart_streams(self):
-        self.stop_streams()
-        self.root.after(0, lambda: [
-            self.labels[i].configure(image="", text="Disabled" if not self.ips[i] else "Loading...", fg="white") or
-            self.fullscreen_buttons[i].place_forget()
-            for i in range(4)
-        ])
-        self.start_streams()
-
     def stop_streams(self):
+        logging.info("Stopping all streams")
         self.running = False
         for i in range(4):
-            if self.media_players[i]:
-                try:
-                    self.media_players[i].stop()
-                    logging.info(f"Stopped media player {i}")
-                except Exception as e:
-                    logging.error(f"Error stopping media player {i}: {e}")
-                self.media_players[i] = None
-            if self.vlc_instances[i]:
-                try:
-                    self.vlc_instances[i].release()
-                    logging.info(f"Released VLC instance {i}")
-                except Exception as e:
-                    logging.error(f"Error releasing VLC instance {i}: {e}")
-                self.vlc_instances[i] = None
-            if self.fullscreen_buttons[i]:
-                self.root.after(0, lambda idx=i: self.fullscreen_buttons[idx].place_forget())
-        time.sleep(1.0)
+            try:
+                # Stop python-vlc media player
+                if self.media_players[i]:
+                    try:
+                        self.media_players[i].stop()
+                        logging.info(f"Stopped media player {i}")
+                    except Exception as e:
+                        logging.error(f"Error stopping media player {i}: {e}")
+                    self.media_players[i] = None
+                # Release python-vlc instance
+                if self.vlc_instances[i]:
+                    try:
+                        self.vlc_instances[i].release()
+                        logging.info(f"Released VLC instance {i}")
+                    except Exception as e:
+                        logging.error(f"Error releasing VLC instance {i}: {e}")
+                    self.vlc_instances[i] = None
+                # Terminate VLC CLI process
+                if self.vlc_processes[i]:
+                    try:
+                        # Ensure audio is muted to prevent playback during shutdown
+                        if self.audio_enabled[i]:
+                            self._mute_vlc_cli_audio(i)
+                        pid = self.vlc_processes[i].pid
+                        self.vlc_processes[i].terminate()
+                        self.vlc_processes[i].wait(timeout=5)  # 5-second timeout
+                        logging.info(f"Terminated VLC CLI process {i} (PID {pid})")
+                    except subprocess.TimeoutExpired:
+                        logging.warning(f"VLC CLI process {i} (PID {pid}) did not terminate within 5 seconds, sending SIGKILL")
+                        self.vlc_processes[i].kill()
+                        try:
+                            self.vlc_processes[i].wait(timeout=1)  # Short wait after SIGKILL
+                            logging.info(f"VLC CLI process {i} (PID {pid}) killed")
+                        except subprocess.TimeoutExpired:
+                            logging.error(f"VLC CLI process {i} (PID {pid}) could not be killed")
+                    except Exception as e:
+                        logging.error(f"Error terminating VLC CLI process {i}: {e}")
+                    self.vlc_processes[i] = None
+                # Hide fullscreen button
+                if self.fullscreen_buttons[i]:
+                    self.root.after(0, lambda idx=i: self.fullscreen_buttons[idx].place_forget())
+            except Exception as e:
+                logging.error(f"Error during cleanup of stream {i}: {e}")
+        time.sleep(0.5)
         self.running = True
         logging.info("All streams stopped and cleaned up")
 
@@ -571,37 +860,53 @@ class RTSPViewer:
         else:
             self.is_fullscreen = True
             self.fullscreen_index = index
+
+        # Manage audio for all streams
         for i in range(4):
-            if self.media_players[i]:
-                try:
-                    if i == self.fullscreen_index and self.is_fullscreen and self.audio_enabled[i]:
-                        # Wait for VLC to stabilize
-                        time.sleep(0.15)  # Increased from 0.1 to 0.15 for more reliability
-                        # Toggle audio to reset VLC's audio pipeline
-                        self.media_players[i].audio_set_volume(0)
-                        time.sleep(0.05)
-                        # Retry setting volume to 100 with timeout
-                        start_time = time.time()
-                        max_attempts = 7
-                        for attempt in range(max_attempts):
-                            if time.time() - start_time > 0.5:  # 500ms total timeout
-                                logging.warning(f"Stream {i} volume setting timed out after {attempt} attempts")
-                                break
-                            self.media_players[i].audio_set_volume(100)  # Set to 100%
-                            time.sleep(0.05)  # Brief delay between retries
-                            current_volume = self.media_players[i].audio_get_volume()
-                            player_state = self.media_players[i].get_state()
-                            if current_volume == 100:
-                                logging.debug(f"Stream {i} volume successfully set to 100 on attempt {attempt+1}, state: {player_state}")
-                                break
-                            logging.debug(f"Stream {i} volume set attempt {attempt+1} failed, current: {current_volume}, state: {player_state}")
+            if not self.streams[i] or not self.audio_enabled[i]:
+                continue
+            if sys.platform.startswith("win") or (sys.platform.startswith("linux") and not self.use_hardware_acceleration):
+                # python-vlc audio control
+                if self.media_players[i]:
+                    try:
+                        if i == self.fullscreen_index and self.is_fullscreen:
+                            time.sleep(0.15)
+                            self.media_players[i].audio_set_volume(0)
+                            time.sleep(0.05)
+                            start_time = time.time()
+                            max_attempts = 7
+                            for attempt in range(max_attempts):
+                                if time.time() - start_time > 0.5:
+                                    logging.warning(f"Stream {i} volume setting timed out after {attempt} attempts")
+                                    break
+                                self.media_players[i].audio_set_volume(100)
+                                time.sleep(0.05)
+                                current_volume = self.media_players[i].audio_get_volume()
+                                player_state = self.media_players[i].get_state()
+                                if current_volume == 100:
+                                    logging.debug(f"Stream {i} volume successfully set to 100 on attempt {attempt+1}, state: {player_state}")
+                                    break
+                                logging.debug(f"Stream {i} volume set attempt {attempt+1} failed, current: {current_volume}, state: {player_state}")
+                            else:
+                                logging.warning(f"Stream {i} failed to set volume to 100 after {max_attempts} attempts")
                         else:
-                            logging.warning(f"Stream {i} failed to set volume to 100 after {max_attempts} attempts, final volume: {current_volume}")
-                    else:
-                        self.media_players[i].audio_set_volume(0)
-                        logging.debug(f"Stream {i} volume set to 0")
-                except Exception as e:
-                    logging.error(f"Failed to set audio volume for stream {i}: {e}")
+                            self.media_players[i].audio_set_volume(0)
+                            logging.debug(f"Stream {i} volume set to 0")
+                    except Exception as e:
+                        logging.error(f"Failed to set audio volume for stream {i}: {e}")
+            else:
+                # VLC CLI audio control
+                if self.vlc_processes[i]:
+                    try:
+                        if i == self.fullscreen_index and self.is_fullscreen:
+                            # Delay unmuting and volume setting for the selected stream
+                            threading.Timer(0.5, lambda idx=i: self._unmute_vlc_cli_audio(idx)).start()
+                        else:
+                            # Immediately mute all other streams
+                            self._mute_vlc_cli_audio(i)
+                    except Exception as e:
+                        logging.error(f"Failed to manage audio for VLC CLI stream {i}: {e}")
+
         self.update_layout()
 
     def update_layout(self):
@@ -612,16 +917,15 @@ class RTSPViewer:
                     w, h = self.grid_frame.winfo_width(), self.grid_frame.winfo_height()
                     if w <= 10 or h <= 10:
                         w, h = 1280, 670
-                    # Revert to original: stretch to full grid_frame size
                     self.panels[i].place(x=0, y=0, width=w, height=h)
                     self.panel_sizes[i] = (w, h)
                     self.update_target_dims(i)
-                    if self.media_players[i]:
+                    if self.media_players[i] and (sys.platform.startswith("win") or (sys.platform.startswith("linux") and not self.use_hardware_acceleration)):
                         hwnd = self.labels[i].winfo_id()
-                        self.media_players[i].set_hwnd(hwnd)
+                        self.media_players[i].set_hwnd(hwnd) if sys.platform.startswith("win") else self.media_players[i].set_xwindow(hwnd)
                     if self.fullscreen_buttons[i] and self.streams[i]:
                         self.fullscreen_buttons[i].configure(image=self.minimize_images[i])
-                        self.fullscreen_buttons[i].place(relx=1.0, rely=0.0, x=-35, y=5, anchor="ne")
+                        self.fullscreen_buttons[i].place(relx=1.0, rely=1.0, x=-35, y=-35, anchor="se")
                 else:
                     self.panels[i].place_forget()
                     if self.fullscreen_buttons[i]:
@@ -646,13 +950,16 @@ class RTSPViewer:
             self.panels[3].place(x=ww, y=hh, width=ww, height=hh)
             for i in range(4):
                 self.update_target_dims(i)
-                if self.media_players[i]:
+                if self.media_players[i] and (sys.platform.startswith("win") or (sys.platform.startswith("linux") and not self.use_hardware_acceleration)):
                     hwnd = self.labels[i].winfo_id()
-                    self.media_players[i].set_hwnd(hwnd)
-                    self.media_players[i].audio_set_volume(0)
+                    self.media_players[i].set_hwnd(hwnd) if sys.platform.startswith("win") else self.media_players[i].set_xwindow(hwnd)
+                    if self.audio_enabled[i]:
+                        self.media_players[i].audio_set_volume(0)  # Mute in grid view
+                if self.vlc_processes[i] and self.audio_enabled[i]:
+                    self._mute_vlc_cli_audio(i)  # Mute VLC CLI in grid view
                 if self.fullscreen_buttons[i] and self.streams[i]:
                     self.fullscreen_buttons[i].configure(image=self.fullscreen_images[i])
-                    self.fullscreen_buttons[i].place(relx=1.0, rely=0.0, x=-35, y=5, anchor="ne")
+                    self.fullscreen_buttons[i].place(relx=1.0, rely=1.0, x=-35, y=-35, anchor="se")
                 elif self.fullscreen_buttons[i]:
                     self.fullscreen_buttons[i].place_forget()
             y_offset = 0 if not self.top_panel_visible else 50
@@ -672,7 +979,6 @@ class RTSPViewer:
             self.target_dims[index] = (0, 0)
             logging.debug(f"Stream {index}: Invalid frame shape ({frame_w}, {frame_h}), target_dims=(0, 0)")
             return
-        # Simplified: target matches panel size
         self.target_dims[index] = (w, h)
         logging.debug(f"Stream {index}: Panel=({w}, {h}), Frame=({frame_w}, {frame_h}), Target=({w}, {h})")
 
@@ -768,33 +1074,60 @@ class RTSPViewer:
             ptz.ContinuousMove(request)
         except Exception:
             pass
-    def shutdown_instantly(self):
-        """
-        Instantly and gracefully shut down the application, releasing resources without delays.
-        """
-        logging.info("Initiating instant shutdown")
-        self.running = False  # Stop all stream monitoring loops
 
-        # Destroy the Tkinter root immediately to halt UI updates
+    def shutdown_instantly(self):
+        logging.info("Initiating instant shutdown")
+        self.running = False
+
+        # Destroy Tkinter root
         try:
             self.root.destroy()
             logging.info("Tkinter root destroyed")
         except Exception as e:
             logging.error(f"Error destroying Tkinter root: {e}")
 
-        # Release VLC resources
+        # Cleanup streams
         for i in range(4):
             try:
+                # Stop python-vlc media player
                 if self.media_players[i]:
-                    self.media_players[i].stop()
+                    try:
+                        self.media_players[i].stop()
+                        logging.info(f"Stopped media player {i}")
+                    except Exception as e:
+                        logging.error(f"Error stopping media player {i}: {e}")
                     self.media_players[i] = None
-                    logging.info(f"Stopped media player {i}")
+                # Release python-vlc instance
                 if self.vlc_instances[i]:
-                    self.vlc_instances[i].release()
+                    try:
+                        self.vlc_instances[i].release()
+                        logging.info(f"Released VLC instance {i}")
+                    except Exception as e:
+                        logging.error(f"Error releasing VLC instance {i}: {e}")
                     self.vlc_instances[i] = None
-                    logging.info(f"Released VLC instance {i}")
+                # Terminate VLC CLI process
+                if self.vlc_processes[i]:
+                    try:
+                        # Ensure audio is muted to prevent playback during shutdown
+                        if self.audio_enabled[i]:
+                            self._mute_vlc_cli_audio(i)
+                        pid = self.vlc_processes[i].pid
+                        self.vlc_processes[i].terminate()
+                        self.vlc_processes[i].wait(timeout=5)  # 5-second timeout
+                        logging.info(f"Terminated VLC CLI process {i} (PID {pid})")
+                    except subprocess.TimeoutExpired:
+                        logging.warning(f"VLC CLI process {i} (PID {pid}) did not terminate within 5 seconds, sending SIGKILL")
+                        self.vlc_processes[i].kill()
+                        try:
+                            self.vlc_processes[i].wait(timeout=1)  # Short wait after SIGKILL
+                            logging.info(f"VLC CLI process {i} (PID {pid}) killed")
+                        except subprocess.TimeoutExpired:
+                            logging.error(f"VLC CLI process {i} (PID {pid}) could not be killed")
+                    except Exception as e:
+                        logging.error(f"Error terminating VLC CLI process {i}: {e}")
+                    self.vlc_processes[i] = None
             except Exception as e:
-                logging.error(f"Error releasing VLC resources for stream {i}: {e}")
+                logging.error(f"Error during shutdown of stream {i}: {e}")
 
         # Clear ONVIF camera references
         try:
@@ -804,7 +1137,8 @@ class RTSPViewer:
             logging.error(f"Error clearing ONVIF cameras: {e}")
 
         logging.info("Shutdown completed")
-        
+
+
     def cleanup(self):
         self.shutdown_instantly()
 
