@@ -247,11 +247,16 @@ class tapoStreamer:
         self.stream_initializing = [False] * 4  # From prior refactor
         self.stream_init_lock = threading.Lock()  # From prior refactor
         self.stream_cleanup_events = [threading.Event() for _ in range(4)]  # Events for cleanup signaling
+        # Locks that serialise archive-entry background threads against
+        # concurrent toggle_archive_mode(exit) calls on the main thread.
+        # Acquiring the lock in _enter_archive_mode_thread and checking it
+        # in the exit path prevents two threads calling cleanup_stream()
+        # simultaneously, which causes a libvlc segfault.
+        self.archive_entry_locks = [threading.Lock() for _ in range(4)]
         self.media_players = [None] * 4
         self.streams = [""] * 4
         self.panels = [None] * 4
         self.labels = [None] * 4
-        self.drop_counts = [0] * 4
         self.drop_timestamps = [[] for _ in range(4)]
         self.fullscreen_buttons = [None] * 4
         self.fullscreen_images = [None] * 4
@@ -351,6 +356,12 @@ class tapoStreamer:
         self.username = ""
         self.password = ""
         self.archive_dir = ""
+        # Cached result of the last os.path.exists(archive_dir) probe.
+        # build_config_panel() reads this instead of calling
+        # os.path.exists() directly, since that can block for seconds on
+        # a spun-down disk or slow network mount and was previously
+        # freezing the main thread on every config panel rebuild.
+        # Optimistically True so the button shows before the first probe.
         self.ips = ["", "", "", ""]
         self.hq_enabled = [True] * 4
         self.audio_enabled = [True] * 4
@@ -363,14 +374,16 @@ class tapoStreamer:
         self.default_playback_speed = 1.0
         # New stream reliability settings
         self.enable_retries = True
-        self.max_retry_attempts = 3
-        self.initial_backoff_delay = 1.0
+        self.max_retry_attempts = 5
+        self.initial_backoff_delay = 2.0
         self.enable_quality_downgrade = True
-        self.drop_threshold = 10
-        self.drop_window = 5.0
-        self.downgrade_cooldown = 60.0
+        self.drop_threshold = 8
+        self.drop_window = 30.0
+        self.downgrade_cooldown = 120.0
         self.enable_auto_revert_hq = False
-        self.stability_period = 60.0
+        self.stability_period = 300.0
+        self.no_frame_timeout = 15.0
+        self.archive_font = "arial"
 
         # Load from config file if it exists
         if os.path.exists(self.config_file):
@@ -400,6 +413,11 @@ class tapoStreamer:
                 self.downgrade_cooldown = config.get("downgrade_cooldown", self.downgrade_cooldown)
                 self.enable_auto_revert_hq = config.get("enable_auto_revert_hq", self.enable_auto_revert_hq)
                 self.stability_period = config.get("stability_period", self.stability_period)
+                raw_no_frame = config.get("no_frame_timeout", self.no_frame_timeout)
+                self.no_frame_timeout = float(raw_no_frame) if raw_no_frame > 5 else 15.0
+                raw_font = config.get("archive_font", self.archive_font)
+                ALLOWED_FONTS = {"arial", "helvetica", "courier", "times", "verdana", "tahoma", "trebuchet ms"}
+                self.archive_font = raw_font if raw_font in ALLOWED_FONTS else "arial"
 
                 # Validate saved_window_size
                 try:
@@ -429,22 +447,22 @@ class tapoStreamer:
                 # Validate new settings
                 if self.max_retry_attempts < 1:
                     logging.warning(f"Invalid max_retry_attempts: {self.max_retry_attempts}, using default 3")
-                    self.max_retry_attempts = 3
+                    self.max_retry_attempts = 5
                 if self.initial_backoff_delay <= 0:
                     logging.warning(f"Invalid initial_backoff_delay: {self.initial_backoff_delay}, using default 1.0")
-                    self.initial_backoff_delay = 1.0
+                    self.initial_backoff_delay = 2.0
                 if self.drop_threshold < 1:
                     logging.warning(f"Invalid drop_threshold: {self.drop_threshold}, using default 10")
-                    self.drop_threshold = 10
+                    self.drop_threshold = 8
                 if self.drop_window <= 0:
                     logging.warning(f"Invalid drop_window: {self.drop_window}, using default 5.0")
-                    self.drop_window = 5.0
+                    self.drop_window = 30.0
                 if self.downgrade_cooldown < 10:
                     logging.warning(f"Invalid downgrade_cooldown: {self.downgrade_cooldown}, using default 30.0")
-                    self.downgrade_cooldown = 30.0
+                    self.downgrade_cooldown = 120.0
                 if self.stability_period < 10:
                     logging.warning(f"Invalid stability_period: {self.stability_period}, using default 30.0")
-                    self.stability_period = 30.0
+                    self.stability_period = 300.0
 
             except json.JSONDecodeError as e:
                 logging.error(f"Failed to parse config file {self.config_file}: {e}. Using default settings.")
@@ -481,7 +499,9 @@ class tapoStreamer:
             "drop_window": self.drop_window,
             "downgrade_cooldown": self.downgrade_cooldown,
             "enable_auto_revert_hq": self.enable_auto_revert_hq,
-            "stability_period": self.stability_period
+            "stability_period": self.stability_period,
+            "no_frame_timeout": self.no_frame_timeout,
+            "archive_font": self.archive_font
         }
         try:
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
@@ -497,7 +517,6 @@ class tapoStreamer:
     def show_config_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Configuration")
-        dialog.geometry("515x700")  # Increased height to accommodate new fields
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -509,161 +528,225 @@ class tapoStreamer:
         # Core Tab
         core_frame = ttk.Frame(notebook)
         notebook.add(core_frame, text="General")
+        core_frame.columnconfigure(1, weight=1)
 
         # Advanced Tab
         advanced_frame = ttk.Frame(notebook)
         notebook.add(advanced_frame, text="Advanced")
+        advanced_frame.columnconfigure(1, weight=1)
 
-        # --- Core Tab Contents ---
-        y_offset = 20
+        # Shared grid options
+        LBL  = dict(sticky="w",  padx=(12, 6), pady=4)
+        WIDE = dict(sticky="we", padx=(0,  12), pady=4)
+        SPAN = dict(sticky="w",  padx=(12, 12), pady=4, columnspan=2)
+
+        # --- General Tab ---
+        row = 0
 
         # Username
-        tk.Label(core_frame, text="Username:", font=("Arial", 10)).place(x=20, y=y_offset)
-        username_entry = tk.Entry(core_frame, width=38)
+        tk.Label(core_frame, text="Username:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
+        username_entry = tk.Entry(core_frame, width=32)
         username_entry.insert(0, self.username)
-        username_entry.place(x=120, y=y_offset)
-        y_offset += 40
+        username_entry.grid(row=row, column=1, **WIDE)
+        row += 1
 
         # Password
-        tk.Label(core_frame, text="Password:", font=("Arial", 10)).place(x=20, y=y_offset)
-        password_entry = tk.Entry(core_frame, width=38)
+        tk.Label(core_frame, text="Password:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
+        password_entry = tk.Entry(core_frame, width=32)
         password_entry.insert(0, self.password)
-        password_entry.place(x=120, y=y_offset)
-        y_offset += 40
+        password_entry.grid(row=row, column=1, **WIDE)
+        row += 1
 
         # Video Path
-        tk.Label(core_frame, text="Video Path:", font=("Arial", 10)).place(x=20, y=y_offset)
-        archive_entry = tk.Entry(core_frame, width=38)
+        tk.Label(core_frame, text="Video Path:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
+        archive_entry = tk.Entry(core_frame, width=32)
         archive_entry.insert(0, self.archive_dir)
-        archive_entry.place(x=120, y=y_offset)
-        y_offset += 40
+        archive_entry.grid(row=row, column=1, **WIDE)
+        row += 1
 
         # Camera IPs and settings
+        # Each cam row: label + IP entry in col 0-1, then HQ/Audio/PTZ checkboxes in a sub-frame in col 1
         ip_entries = []
         hq_checkboxes = []
         audio_checkboxes = []
         ptz_checkboxes = []
         for i in range(4):
-            tk.Label(core_frame, text=f"Cam{i+1} IP:", font=("Arial", 10)).place(x=20, y=y_offset)
-            ip_entry = tk.Entry(core_frame, width=15)
+            tk.Label(core_frame, text=f"Cam {i+1} IP:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
+
+            cam_frame = ttk.Frame(core_frame)
+            cam_frame.grid(row=row, column=1, sticky="we", padx=(0, 12), pady=4)
+
+            ip_entry = tk.Entry(cam_frame, width=16)
             ip_entry.insert(0, self.ips[i])
-            ip_entry.place(x=120, y=y_offset)
+            ip_entry.pack(side="left")
             ip_entries.append(ip_entry)
 
             hq_var = tk.BooleanVar(value=self.hq_enabled[i])
-            hq_cb = ttk.Checkbutton(core_frame, text="HQ", variable=hq_var)
-            hq_cb.place(x=280, y=y_offset)
+            ttk.Checkbutton(cam_frame, text="HQ", variable=hq_var).pack(side="left", padx=(8, 0))
             hq_checkboxes.append(hq_var)
 
             audio_var = tk.BooleanVar(value=self.audio_enabled[i])
-            audio_cb = ttk.Checkbutton(core_frame, text="Audio", variable=audio_var)
-            audio_cb.place(x=333, y=y_offset)
+            ttk.Checkbutton(cam_frame, text="Audio", variable=audio_var).pack(side="left", padx=(8, 0))
             audio_checkboxes.append(audio_var)
 
             ptz_var = tk.BooleanVar(value=self.ptz_supported[i])
-            ptz_cb = ttk.Checkbutton(core_frame, text="PTZ", variable=ptz_var)
-            ptz_cb.place(x=400, y=y_offset)
+            ttk.Checkbutton(cam_frame, text="PTZ", variable=ptz_var).pack(side="left", padx=(8, 0))
             ptz_checkboxes.append(ptz_var)
-            y_offset += 40
+
+            row += 1
 
         # PTZ Travel Distance
-        tk.Label(core_frame, text="PTZ Travel Distance:", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(core_frame, text="PTZ Travel Distance:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         ptz_resolution_var = tk.IntVar(value=self.ptz_resolution)
-        ptz_resolution_dropdown = ttk.Combobox(
-            core_frame, textvariable=ptz_resolution_var, values=[1, 2, 3, 4, 5], state="readonly", width=5
-        )
-        ptz_resolution_dropdown.place(x=280, y=y_offset)
-        y_offset += 40
+        ttk.Combobox(
+            core_frame, textvariable=ptz_resolution_var, values=[1, 2, 3, 4, 5], state="readonly", width=6
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
         # Default Playback Speed
-        tk.Label(core_frame, text="Default Playback Speed:", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(core_frame, text="Default Playback Speed:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         playback_speed_var = tk.DoubleVar(value=self.default_playback_speed)
-        playback_speed_dropdown = ttk.Combobox(
-            core_frame, textvariable=playback_speed_var, values=self.speed_cycle, state="readonly", width=5
+        ttk.Combobox(
+            core_frame, textvariable=playback_speed_var, values=self.speed_cycle, state="readonly", width=6
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        # Archive Font
+        tk.Label(core_frame, text="Archive Font:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
+        ARCHIVE_FONT_OPTIONS = ["Arial", "Helvetica", "Courier", "Times", "Verdana", "Tahoma", "Trebuchet MS"]
+        archive_font_var = tk.StringVar(value=self.archive_font.title())
+        ttk.Combobox(
+            core_frame, textvariable=archive_font_var, values=ARCHIVE_FONT_OPTIONS, state="readonly", width=16
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        ttk.Separator(core_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="we", padx=12, pady=6
         )
-        playback_speed_dropdown.place(x=280, y=y_offset)
-        y_offset += 40
+        row += 1
 
-        # Enable fullscreen buttons checkbox
+        # Show Stream Buttons
         fullscreen_buttons_var = tk.BooleanVar(value=self.enable_fullscreen_buttons)
-        ttk.Checkbutton(core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var).place(x=20, y=y_offset)
-        y_offset += 40
+        ttk.Checkbutton(core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var).grid(
+            row=row, column=0, **SPAN
+        )
+        row += 1
 
-        # Save Current Window Size checkbox
+        # Save Window Size
         save_window_size_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(core_frame, text="Save Window Size", variable=save_window_size_var).place(x=20, y=y_offset)
-        y_offset += 40
+        ttk.Checkbutton(core_frame, text="Save Window Size", variable=save_window_size_var).grid(
+            row=row, column=0, **SPAN
+        )
+        row += 1
 
-        # --- Advanced Tab Contents ---
-        y_offset = 20
+        # --- Advanced Tab ---
+        row = 0
 
-        # Stream retry settings
-        tk.Label(advanced_frame, text="Stream Reliability:", font=("Arial", 10, "bold")).place(x=20, y=y_offset)
-        y_offset += 30
+        # Stream Reliability section header
+        tk.Label(advanced_frame, text="Stream Reliability", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(10, 2)
+        )
+        row += 1
+        ttk.Separator(advanced_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="we", padx=12, pady=(0, 4)
+        )
+        row += 1
 
         enable_retries_var = tk.BooleanVar(value=self.enable_retries)
-        ttk.Checkbutton(advanced_frame, text="Enable Automatic Retries", variable=enable_retries_var).place(x=20, y=y_offset)
-        y_offset += 30
+        ttk.Checkbutton(advanced_frame, text="Enable Automatic Retries", variable=enable_retries_var).grid(
+            row=row, column=0, **SPAN
+        )
+        row += 1
 
-        tk.Label(advanced_frame, text="Max Retry Attempts:", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(advanced_frame, text="Max Retry Attempts:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         max_retry_attempts_entry = tk.Entry(advanced_frame, width=10)
         max_retry_attempts_entry.insert(0, str(self.max_retry_attempts))
-        max_retry_attempts_entry.place(x=250, y=y_offset)
-        y_offset += 30
+        max_retry_attempts_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
-        tk.Label(advanced_frame, text="Initial Backoff Delay (s):", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(advanced_frame, text="Initial Backoff Delay (s):", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         initial_backoff_delay_entry = tk.Entry(advanced_frame, width=10)
         initial_backoff_delay_entry.insert(0, str(self.initial_backoff_delay))
-        initial_backoff_delay_entry.place(x=250, y=y_offset)
+        initial_backoff_delay_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
-        # Stream quality downgrading settings
-        y_offset += 40
-        tk.Label(advanced_frame, text="Quality Downgrading:", font=("Arial", 10, "bold")).place(x=20, y=y_offset)
+        # Quality Downgrading section header
+        tk.Label(advanced_frame, text="Quality Downgrading", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(10, 2)
+        )
+        row += 1
+        ttk.Separator(advanced_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="we", padx=12, pady=(0, 4)
+        )
+        row += 1
 
-        y_offset += 30
         enable_quality_downgrade_var = tk.BooleanVar(value=self.enable_quality_downgrade)
-        ttk.Checkbutton(advanced_frame, text="Enable Quality Downgrading", variable=enable_quality_downgrade_var).place(x=20, y=y_offset)
+        ttk.Checkbutton(advanced_frame, text="Enable Quality Downgrading", variable=enable_quality_downgrade_var).grid(
+            row=row, column=0, **SPAN
+        )
+        row += 1
 
-        y_offset += 30
         enable_auto_revert_hq_var = tk.BooleanVar(value=self.enable_auto_revert_hq)
-        ttk.Checkbutton(advanced_frame, text="Enable Auto-Revert to HQ", variable=enable_auto_revert_hq_var).place(x=20, y=y_offset)
+        ttk.Checkbutton(advanced_frame, text="Enable Auto-Revert to HQ", variable=enable_auto_revert_hq_var).grid(
+            row=row, column=0, **SPAN
+        )
+        row += 1
 
-        y_offset += 30
-        tk.Label(advanced_frame, text="Frame Drop Threshold:", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(advanced_frame, text="Frame Drop Threshold:", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         drop_threshold_entry = tk.Entry(advanced_frame, width=10)
         drop_threshold_entry.insert(0, str(self.drop_threshold))
-        drop_threshold_entry.place(x=250, y=y_offset)
+        drop_threshold_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
-        y_offset += 30
-        tk.Label(advanced_frame, text="Frame Drop Window (s):", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(advanced_frame, text="Frame Drop Window (s):", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         drop_window_entry = tk.Entry(advanced_frame, width=10)
         drop_window_entry.insert(0, str(self.drop_window))
-        drop_window_entry.place(x=250, y=y_offset)
+        drop_window_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
-        y_offset += 30
-        tk.Label(advanced_frame, text="Downgrade Cooldown (s):", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(advanced_frame, text="Downgrade Cooldown (s):", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         downgrade_cooldown_entry = tk.Entry(advanced_frame, width=10)
         downgrade_cooldown_entry.insert(0, str(self.downgrade_cooldown))
-        downgrade_cooldown_entry.place(x=250, y=y_offset)
+        downgrade_cooldown_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
-        y_offset += 30
-        tk.Label(advanced_frame, text="Stability Period (s):", font=("Arial", 10)).place(x=20, y=y_offset)
+        tk.Label(advanced_frame, text="Stability Period (s):", font=("Arial", 10)).grid(row=row, column=0, **LBL)
         stability_period_entry = tk.Entry(advanced_frame, width=10)
         stability_period_entry.insert(0, str(self.stability_period))
-        stability_period_entry.place(x=250, y=y_offset)
+        stability_period_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
-        # VLC Params
-        y_offset += 40
-        tk.Label(advanced_frame, text="VLC Options:", font=("Arial", 10)).place(x=20, y=y_offset)
-        y_offset += 30
+        tk.Label(advanced_frame, text="No-Frame Timeout (s):", font=("Arial", 10)).grid(row=row, column=0, **LBL)
+        no_frame_timeout_entry = tk.Entry(advanced_frame, width=10)
+        no_frame_timeout_entry.insert(0, str(self.no_frame_timeout))
+        no_frame_timeout_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        # VLC Options section header
+        tk.Label(advanced_frame, text="VLC Options", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(10, 2)
+        )
+        row += 1
+        ttk.Separator(advanced_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="we", padx=12, pady=(0, 4)
+        )
+        row += 1
+
         vlc_params = tk.Text(advanced_frame, width=45, height=6)
         vlc_params.insert("1.0", ' '.join(self.vlcparams or self.DEFAULT_VLC_PARAMS))
-        vlc_params.place(x=20, y=y_offset)
+        vlc_params.grid(row=row, column=0, columnspan=2, sticky="we", padx=(12, 12), pady=4)
+        row += 1
 
-        # Debug mode checkbox
-        y_offset += 140
+        ttk.Separator(advanced_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="we", padx=12, pady=6
+        )
+        row += 1
+
+        # Debug mode
         debug_var = tk.BooleanVar(value=self.config_debug)
-        ttk.Checkbutton(advanced_frame, text="Enable Debug Logging", variable=debug_var).place(x=20, y=y_offset)
+        ttk.Checkbutton(advanced_frame, text="Enable Debug Logging", variable=debug_var).grid(
+            row=row, column=0, **SPAN
+        )
 
         # Save and Cancel Buttons
         button_frame = ttk.Frame(dialog)
@@ -679,7 +762,7 @@ class tapoStreamer:
                 enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry,
                 enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry,
                 downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry,
-                playback_speed_var
+                playback_speed_var, archive_font_var, no_frame_timeout_entry
             )
         ).pack(side="left", padx=5)
 
@@ -690,7 +773,7 @@ class tapoStreamer:
 
         dialog.update_idletasks()
 
-    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var):
+    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, archive_font_var=None, no_frame_timeout_entry=None):
         old_fullscreen_buttons = self.enable_fullscreen_buttons
         self.username = username_entry.get().strip()
         self.password = password_entry.get().strip()
@@ -701,6 +784,10 @@ class tapoStreamer:
         self.ptz_supported = [v.get() for v in ptz_checkboxes]
         self.enable_fullscreen_buttons = fullscreen_buttons_var.get()
         self.config_debug = debug_var.get()
+        if archive_font_var is not None:
+            ALLOWED_FONTS = {"arial", "helvetica", "courier", "times", "verdana", "tahoma", "trebuchet ms"}
+            chosen = archive_font_var.get().lower()
+            self.archive_font = chosen if chosen in ALLOWED_FONTS else "arial"
     
         # Save default playback speed
         try:
@@ -717,53 +804,61 @@ class tapoStreamer:
         try:
             self.max_retry_attempts = int(max_retry_attempts_entry.get().strip())
             if self.max_retry_attempts < 1:
-                logging.warning(f"Invalid max_retry_attempts: {self.max_retry_attempts}, using default 3")
-                self.max_retry_attempts = 3
+                logging.warning(f"Invalid max_retry_attempts: {self.max_retry_attempts}, using default 5")
+                self.max_retry_attempts = 5
         except ValueError:
-            logging.warning(f"Invalid max_retry_attempts input, using default 3")
-            self.max_retry_attempts = 3
+            logging.warning(f"Invalid max_retry_attempts input, using default 5")
+            self.max_retry_attempts = 5
         try:
             self.initial_backoff_delay = float(initial_backoff_delay_entry.get().strip())
             if self.initial_backoff_delay <= 0:
-                logging.warning(f"Invalid initial_backoff_delay: {self.initial_backoff_delay}, using default 1.0")
-                self.initial_backoff_delay = 1.0
+                logging.warning(f"Invalid initial_backoff_delay: {self.initial_backoff_delay}, using default 2.0")
+                self.initial_backoff_delay = 2.0
         except ValueError:
-            logging.warning(f"Invalid initial_backoff_delay input, using default 1.0")
-            self.initial_backoff_delay = 1.0
+            logging.warning(f"Invalid initial_backoff_delay input, using default 2.0")
+            self.initial_backoff_delay = 2.0
         self.enable_quality_downgrade = enable_quality_downgrade_var.get()
         try:
             self.drop_threshold = int(drop_threshold_entry.get().strip())
             if self.drop_threshold < 1:
-                logging.warning(f"Invalid drop_threshold: {self.drop_threshold}, using default 10")
-                self.drop_threshold = 10
+                logging.warning(f"Invalid drop_threshold: {self.drop_threshold}, using default 8")
+                self.drop_threshold = 8
         except ValueError:
-            logging.warning(f"Invalid drop_threshold input, using default 10")
-            self.drop_threshold = 10
+            logging.warning(f"Invalid drop_threshold input, using default 8")
+            self.drop_threshold = 8
         try:
             self.drop_window = float(drop_window_entry.get().strip())
             if self.drop_window <= 0:
-                logging.warning(f"Invalid drop_window: {self.drop_window}, using default 5.0")
-                self.drop_window = 5.0
+                logging.warning(f"Invalid drop_window: {self.drop_window}, using default 30.0")
+                self.drop_window = 30.0
         except ValueError:
-            logging.warning(f"Invalid drop_window input, using default 5.0")
-            self.drop_window = 5.0
+            logging.warning(f"Invalid drop_window input, using default 30.0")
+            self.drop_window = 30.0
         try:
             self.downgrade_cooldown = float(downgrade_cooldown_entry.get().strip())
             if self.downgrade_cooldown < 10:
-                logging.warning(f"Invalid downgrade_cooldown: {self.downgrade_cooldown}, using default 60.0")
-                self.downgrade_cooldown = 60.0
+                logging.warning(f"Invalid downgrade_cooldown: {self.downgrade_cooldown}, using default 120.0")
+                self.downgrade_cooldown = 120.0
         except ValueError:
-            logging.warning(f"Invalid downgrade_cooldown input, using default 60.0")
-            self.downgrade_cooldown = 60.0
+            logging.warning(f"Invalid downgrade_cooldown input, using default 120.0")
+            self.downgrade_cooldown = 120.0
         self.enable_auto_revert_hq = enable_auto_revert_hq_var.get()
         try:
             self.stability_period = float(stability_period_entry.get().strip())
             if self.stability_period < 10:
                 logging.warning(f"Invalid stability_period: {self.stability_period}, using default 300.0")
-                self.stability_period = 10.0
+                self.stability_period = 300.0
         except ValueError:
             logging.warning(f"Invalid stability_period input, using default 300.0")
             self.stability_period = 300.0
+        try:
+            self.no_frame_timeout = float(no_frame_timeout_entry.get().strip())
+            if self.no_frame_timeout < 5:
+                logging.warning(f"Invalid no_frame_timeout: {self.no_frame_timeout}, using default 15.0")
+                self.no_frame_timeout = 15.0
+        except ValueError:
+            logging.warning(f"Invalid no_frame_timeout input, using default 15.0")
+            self.no_frame_timeout = 15.0
 
         try:
             ptz_resolution = ptz_resolution_var.get()
@@ -797,7 +892,6 @@ class tapoStreamer:
 
         self.onvif_cams = {}
         self.ptz_click_counts = [0] * 4
-        self.drop_counts = [0] * 4
         self.drop_timestamps = [[] for _ in range(4)]
         self.update_streams()
         self.save_config()
@@ -1108,6 +1202,22 @@ class tapoStreamer:
     def exit_fullscreen(self, event=None):
         logging.debug(f"exit_fullscreen called (event={event}, is_fullscreen={self.is_fullscreen})")
         if self.is_fullscreen:
+            idx = self.fullscreen_index
+
+            # While fullscreen and in archive mode, right-click acts as a
+            # "back" button: playing clip -> clip browser -> folder
+            # browser -> live feed (still fullscreen). go_back() handles
+            # each of these steps, including stopping any playing clip
+            # before its embedded VLC widget is destroyed (avoiding a
+            # BadWindow X error) and exiting archive mode entirely once
+            # at the archive root (which returns to the live view while
+            # remaining fullscreen).
+            if idx is not None and idx >= 0 and self.is_archive_mode[idx]:
+                self.go_back(idx)
+                return
+
+            # Already on the live feed: right-click exits fullscreen to
+            # the grid view.
             self.is_fullscreen = False
             self.fullscreen_index = -1
 
@@ -1225,8 +1335,7 @@ class tapoStreamer:
 
             # Pack buttons based on state
             if self.is_fullscreen and self.fullscreen_index is not None:
-                if (self.archive_dir and os.path.exists(self.archive_dir) and
-                    self.streams[self.fullscreen_index]):
+                if (self.archive_dir and self.streams[self.fullscreen_index]):
                     self.archive_buttons[self.fullscreen_index].pack(pady=5, padx=10)
                 if ptz_enabled:
                     for button in self.ptz_buttons:
@@ -1387,7 +1496,12 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Failed to update label: {e}")
 
     def try_init_stream_with_retries(self, index):
-        """Attempt to initialize a stream with retries, managing all label updates."""
+        """Attempt to initialize a stream with retries, managing all label updates.
+
+        Quality downgrades made here or by the monitor are session-only: hq_enabled
+        is changed in memory but never saved, so the next app start uses the
+        user-configured value from the config file.
+        """
         with self.stream_init_lock:
             if self.stream_initializing[index]:
                 logging.warning(f"Stream {index}: Already initializing, skipping retry")
@@ -1406,15 +1520,20 @@ class tapoStreamer:
             max_attempts = self.max_retry_attempts if self.enable_retries else 1
             backoff_delay = self.initial_backoff_delay
             max_backoff = 30.0
-            original_hq_setting = self.hq_enabled[index]  # Store original HQ setting
 
             for attempt in range(max_attempts):
-                # On the final retry attempt, switch to low quality (stream2) if enabled
+                # Check if we have been asked to abort (e.g. user switched to
+                # archive mode while we were retrying or sleeping in backoff).
+                if self.stream_cleanup_events[index].is_set():
+                    logging.info(f"Stream {index}: Abort signal received, stopping init")
+                    return False
+
+                # On the final retry attempt, drop to LQ for this session only
                 if attempt == max_attempts - 1 and self.enable_quality_downgrade and self.hq_enabled[index]:
-                    logging.info(f"Stream {index}: Final retry, switching to low quality (stream2)")
+                    logging.info(f"Stream {index}: Final retry, switching to low quality for this session")
                     self.hq_enabled[index] = False
                     self.update_stream(index)
-                    self.update_stream_label(index, f"Final Attempt, retrying at Low Quality...)")
+                    self.update_stream_label(index, "Final attempt, trying Low Quality...")
                 elif attempt > 0:
                     self.update_stream_label(index, f"Retrying... (Attempt {attempt+1}/{max_attempts})")
                 else:
@@ -1429,10 +1548,6 @@ class tapoStreamer:
                         if self.fullscreen_buttons[index]:
                             self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget())
                         logging.error(f"Stream {index}: Network unreachable after all attempts")
-                        # Restore original HQ setting if we modified it
-                        if self.hq_enabled[index] != original_hq_setting:
-                            self.hq_enabled[index] = original_hq_setting
-                            self.update_stream(index)
                         return False
                     time.sleep(backoff_delay)
                     backoff_delay = min(backoff_delay * 2, max_backoff)
@@ -1442,12 +1557,6 @@ class tapoStreamer:
                 if self.init_stream(index):
                     logging.info(f"Stream {index}: Initialized successfully")
                     self.set_audio_state(index, mute=True)
-                    # Restore original HQ setting if we modified it and initialization succeeded
-                    if self.hq_enabled[index] != original_hq_setting:
-                        self.hq_enabled[index] = original_hq_setting
-                        self.update_stream(index)
-                        self.save_config()
-                    # Restore label bindings after successful initialization
                     self.root.after(0, lambda: self.bind_stream_label(index))
                     return True
 
@@ -1458,12 +1567,8 @@ class tapoStreamer:
                     if self.fullscreen_buttons[index]:
                         self.root.after(0, lambda: self.fullscreen_buttons[index].place_forget())
                     logging.error(f"Stream {index}: All attempts failed")
-                    # Restore original HQ setting if we modified it
-                    if self.hq_enabled[index] != original_hq_setting:
-                        self.hq_enabled[index] = original_hq_setting
-                        self.update_stream(index)
-                        self.save_config()  # Save the restored HQ setting
                     return False
+
                 logging.info(f"Stream {index}: Attempt {attempt+1} failed, retrying in {backoff_delay:.2f}s")
                 time.sleep(backoff_delay)
                 backoff_delay = min(backoff_delay * 2, max_backoff)
@@ -1471,11 +1576,6 @@ class tapoStreamer:
             return False
         except Exception as e:
             logging.error(f"Stream {index}: Unexpected error during retry: {e}")
-            # Restore original HQ setting on error
-            if 'original_hq_setting' in locals() and self.hq_enabled[index] != original_hq_setting:
-                self.hq_enabled[index] = original_hq_setting
-                self.update_stream(index)
-                self.save_config()
             return False
         finally:
             with self.stream_init_lock:
@@ -1635,7 +1735,6 @@ class tapoStreamer:
 
             # Reset stream state
             self.frame_shapes[index] = (0, 0)
-            self.drop_counts[index] = 0
             self.drop_timestamps[index] = []
             self.last_dropped_frames[index] = 0
             self.last_displayed_frames[index] = 0
@@ -1685,18 +1784,27 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Failed to bind retry connection: {e}")
 
     def monitor_stream(self, index, player):
+        """Monitor a live stream for frame drops and state changes.
+
+        Drop detection uses a single sliding-window list (drop_timestamps) that
+        tracks how many polling intervals within drop_window seconds recorded any
+        dropped frames.  drop_threshold is therefore "N bad polling ticks in the
+        window", not raw frame count — keep that in mind when tuning.
+
+        Quality changes are session-only: hq_enabled is mutated in memory but
+        save_config() is never called here, so the user's configured quality is
+        restored on the next app start.
+        """
         logging.info(f"Monitoring stream {index}")
-        
+
         last_check = time.time()
-        last_stream_switch = 0
+        last_stream_switch = 0        # tracks when we last switched quality
         last_stable_time = time.time()
-        last_drop_count = self.drop_counts[index]
-        frame_times = []
         last_frame_time = time.time()
-        no_frame_timeout = 10.0  # Seconds without frames to consider stream failed
+        no_frame_timeout = self.no_frame_timeout
 
         while self.running and self.media_players[index]:
-            # Wait for cleanup event or timeout
+            # Wait for cleanup event or poll timeout
             if self.stream_cleanup_events[index].wait(timeout=1.0):
                 logging.info(f"Stream {index}: Cleanup event set, stopping monitoring")
                 break
@@ -1709,6 +1817,7 @@ class tapoStreamer:
                 if player is None:
                     logging.error(f"Stream {index}: No player, exiting monitor")
                     break
+
                 state = player.get_state()
                 if state in (vlc.State.Ended, vlc.State.Error):
                     logging.error(f"Stream {index} stopped: {state}")
@@ -1716,6 +1825,7 @@ class tapoStreamer:
                     self.update_stream_label(index, "Stream Failed, click to reconnect")
                     self.bind_retry_connection(index)
                     break
+
                 if current_time - last_check >= 1.0:
                     try:
                         stats = vlc.MediaStats()
@@ -1724,73 +1834,86 @@ class tapoStreamer:
                             current_displayed = stats.displayed_pictures
                             displayed_frames = current_displayed - self.last_displayed_frames[index]
                             self.last_displayed_frames[index] = current_displayed
+
                             current_dropped = stats.lost_pictures
                             dropped_frames = current_dropped - self.last_dropped_frames[index]
                             self.last_dropped_frames[index] = current_dropped
+
+                            # Guard against counter resets producing negative deltas
+                            displayed_frames = max(0, displayed_frames)
+                            dropped_frames = max(0, dropped_frames)
+
                             if dropped_frames > 0:
-                                self.drop_counts[index] += dropped_frames
                                 self.drop_timestamps[index].append(current_time)
-                            if displayed_frames < 0 or dropped_frames < 0:
-                                logging.warning(f"Stream {index}: Negative frame delta, resetting")
-                                displayed_frames = max(0, displayed_frames)
-                                dropped_frames = max(0, dropped_frames)
+                                logging.debug(f"Stream {index}: {dropped_frames} dropped frames this tick")
+
                             if displayed_frames > 0:
-                                last_frame_time = current_time  # Update last frame time
+                                last_frame_time = current_time
                         else:
-                            self.drop_counts[index] += 1
+                            # Stats unavailable this tick — record as a drop event but
+                            # do NOT advance last_frame_time so the no-frame timeout
+                            # still fires if the stream is genuinely stalled.
                             self.drop_timestamps[index].append(current_time)
-                            displayed_frames = 1
+                            logging.debug(f"Stream {index}: Stats unavailable this tick")
                     except Exception as e:
                         logging.warning(f"Stream {index}: Error fetching VLC stats: {e}")
-                        self.drop_counts[index] += 1
                         self.drop_timestamps[index].append(current_time)
-                        displayed_frames = 1
 
-                # Track displayed frames
-                if displayed_frames > 0:
-                    frame_times.append((current_time, displayed_frames))
-                frame_times = [(t, f) for t, f in frame_times if current_time - t < self.drop_window]
-                self.drop_timestamps[index] = [t for t in self.drop_timestamps[index] if current_time - t < self.drop_window]
+                    last_check = current_time
 
-                # Check for prolonged absence of displayed frames
+                # Prune drop window
+                self.drop_timestamps[index] = [
+                    t for t in self.drop_timestamps[index]
+                    if current_time - t < self.drop_window
+                ]
+
+                # No-frame timeout
                 if current_time - last_frame_time > no_frame_timeout:
-                    logging.error(f"Stream {index}: No frames displayed for {no_frame_timeout} seconds, marking as failed")
+                    logging.error(f"Stream {index}: No frames for {no_frame_timeout}s, marking failed")
                     self.cleanup_stream(index)
                     self.update_stream_label(index, "Stream Failed, click to reconnect")
                     self.bind_retry_connection(index)
                     break
 
-                # Quality downgrade
-                if self.enable_quality_downgrade and self.hq_enabled[index] and len(self.drop_timestamps[index]) >= self.drop_threshold:
+                # Quality downgrade (session-only — no save_config)
+                if (self.enable_quality_downgrade
+                        and self.hq_enabled[index]
+                        and len(self.drop_timestamps[index]) >= self.drop_threshold):
                     if current_time - last_stream_switch < self.downgrade_cooldown:
-                        logging.warning(f"Stream {index} switch throttled")
+                        logging.warning(f"Stream {index}: Downgrade throttled by cooldown")
                         self.update_stream_label(index, "Waiting: Stream Unstable")
                         continue
+                    logging.warning(f"Stream {index}: Excessive drops, downgrading to LQ for this session")
                     self.update_stream_label(index, "Switching to Low Quality...")
-                    logging.warning(f"Stream {index} excessive drops, switching to stream2")
                     self.hq_enabled[index] = False
                     self.update_stream(index)
-                    self.save_config()
+                    last_stream_switch = current_time
+                    self.drop_timestamps[index].clear()
+                    last_stable_time = current_time
                     self.try_init_stream_with_retries(index)
                     return
 
-                # Revert to high quality
-                if self.enable_auto_revert_hq and not self.hq_enabled[index] and current_time - last_stream_switch > self.downgrade_cooldown:
-                    if current_time - last_stable_time >= self.stability_period and self.drop_counts[index] <= last_drop_count + self.stability_period:
+                # Auto-revert to HQ (session-only — no save_config)
+                # Requires: auto-revert enabled, currently on LQ, cooldown elapsed,
+                # and no drops at all during the full stability_period.
+                if (self.enable_auto_revert_hq
+                        and not self.hq_enabled[index]
+                        and current_time - last_stream_switch >= self.downgrade_cooldown):
+                    if (current_time - last_stable_time >= self.stability_period
+                            and len(self.drop_timestamps[index]) == 0):
+                        logging.info(f"Stream {index}: Stable for {self.stability_period}s, reverting to HQ")
                         self.update_stream_label(index, "Reverting to High Quality...")
-                        logging.info(f"Stream {index}: Stable, reverting to stream1")
                         self.hq_enabled[index] = True
                         self.update_stream(index)
-                        self.save_config()
+                        last_stream_switch = current_time
+                        self.drop_timestamps[index].clear()
                         self.try_init_stream_with_retries(index)
                         return
 
-                # Update stability
-                if self.drop_counts[index] != last_drop_count:
+                # Reset stability clock whenever a drop is recorded
+                if self.drop_timestamps[index]:
                     last_stable_time = current_time
-                    last_drop_count = self.drop_counts[index]
 
-                last_check = current_time
             except Exception as e:
                 logging.error(f"Stream {index}: Monitoring error: {e}")
                 self.update_stream_label(index, "Stream Failed")
@@ -1919,64 +2042,146 @@ class tapoStreamer:
 
     def toggle_all_archive_mode(self):
         """Toggle archive mode for all active streams based on current state."""
-        if not self.archive_dir or not os.path.exists(self.archive_dir):
-            logging.debug("Toggle all archive mode ignored: Invalid archive directory")
+        if not self.archive_dir:
+            logging.debug("Toggle all archive mode ignored: No archive directory configured")
             return
 
         # Check if any stream is in archive mode
         any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
 
-        # Toggle archive mode for relevant streams without rebuilding UI
         if any_archive_mode:
-            # Exit archive mode for all streams in archive mode
+            # Exit archive mode for all streams in archive mode. No disk
+            # access required, safe to do synchronously.
             for i in range(4):
                 if self.is_archive_mode[i]:
                     self.toggle_archive_mode(i, rebuild_ui=False)
                     logging.info(f"Stream {i}: Exited archive mode via global toggle")
-        else:
-            # Enter archive mode for all active streams
-            for i in range(4):
-                if self.streams[i] and not self.is_archive_mode[i]:
-                    self.toggle_archive_mode(i, rebuild_ui=False)
-                    logging.info(f"Stream {i}: Entered archive mode via global toggle")
+            self.build_config_panel()
+            return
 
-        # Single UI update after all toggles
+        eligible = [i for i in range(4) if self.streams[i] and not self.is_archive_mode[i]]
+        if not eligible:
+            return
+
+        for i in eligible:
+            self.toggle_archive_mode(i, rebuild_ui=False)
+            logging.info(f"Stream {i}: Entered archive mode via global toggle")
         self.build_config_panel()
 
     def toggle_archive_mode(self, index, rebuild_ui=True):
-        if not self.archive_dir or not os.path.exists(self.archive_dir):
-            logging.debug(f"Stream {index}: Toggle archive mode ignored, invalid archive directory")
+        if not self.archive_dir:
+            logging.debug(f"Stream {index}: Toggle archive mode ignored, no archive directory configured")
             return
 
+        # If stream init is in progress, signal it to abort via
+        # stream_cleanup_events. _enter_archive_mode_thread checks this
+        # before calling cleanup_stream() so the two threads never race
+        # on the same libvlc player.
         if self.stream_initializing[index]:
-            logging.debug(f"Stream {index}: Currently initializing, aborting archive toggle")
-            return
+            logging.info(f"Stream {index}: Init in progress, signalling abort for archive toggle")
+            self.stream_cleanup_events[index].set()
 
         self.is_archive_mode[index] = not self.is_archive_mode[index]
         logging.info(f"Stream {index}: Archive mode {'enabled' if self.is_archive_mode[index] else 'disabled'}")
 
         if self.is_archive_mode[index]:
-            # Entering archive mode
-            self.cleanup_stream(index)
-
-            root_path = os.path.normpath(os.path.join(self.archive_dir, f"cam{index+1}"))
-            self.pagination_state[index] = {root_path: 0}
+            # Entering archive mode. Swap to the archive canvas
+            # immediately - cleanup_stream() (stopping/releasing the
+            # live VLC player) and the directory probe both happen on a
+            # background thread, since either can take noticeable time
+            # (libvlc stop/release isn't instant, and a spun-down disk
+            # can take seconds to wake).
             self.labels[index].pack_forget()
             self.archive_canvas[index].pack(fill="both", expand=True)
-            self.current_archive_path[index] = root_path
-            self.render_archive_view(index)
+            self.archive_canvas[index].delete("all")
+
             if self.archive_buttons[index]:
                 self.archive_buttons[index].config(state="normal")
+            if rebuild_ui:
+                self.build_config_panel()
+
+            # Show "Loading..." immediately so the panel never looks frozen.
+            loading_shown = threading.Event()
+            panel_width, panel_height = self.panel_sizes[index]
+            self.archive_canvas[index].create_text(
+                panel_width // 2, panel_height // 2,
+                text="Loading...", fill="white", font=("arial", -16)
+            )
+            threading.Thread(target=self._enter_archive_mode_thread, args=(index, loading_shown), daemon=True).start()
         else:
-            # Exiting archive mode
-            self.cleanup_archive_mode(index)
+            # Exiting archive mode. Acquire archive_entry_locks[index] first
+            # so we wait for any in-progress _enter_archive_mode_thread to
+            # finish its cleanup_stream() call before we touch the player.
+            # This prevents the libvlc segfault caused by two threads calling
+            # stop()/release() on the same player simultaneously.
+            with self.archive_entry_locks[index]:
+                self.cleanup_archive_mode(index)
 
             # Start stream initialization in a separate thread
             threading.Thread(target=self.try_init_stream_with_retries, args=(index,), daemon=True).start()
 
-        if rebuild_ui:
-            self.build_config_panel()
-            
+            if rebuild_ui:
+                self.build_config_panel()
+
+    def _enter_archive_mode_thread(self, index, loading_shown):
+        """Background-thread portion of entering archive mode: stop the
+        live VLC player, read the archive directory, then hand off to
+        render_archive_view on the main thread.
+
+        The directory read happens here (off the main thread) so a slow
+        NAS or spun-down HDD doesn't freeze the UI. "Loading..." is shown
+        immediately when archive mode is entered, so there is no need for
+        any special wakeup-detection logic.
+
+        archive_entry_locks[index] is held for the entire duration so that
+        a concurrent exit (right-click while still loading) waits for this
+        thread to finish before calling cleanup_stream(), preventing two
+        threads from releasing the same libvlc player simultaneously.
+        """
+        with self.archive_entry_locks[index]:
+            self._enter_archive_mode_thread_locked(index, loading_shown)
+
+    def _enter_archive_mode_thread_locked(self, index, loading_shown):
+        """Actual body of _enter_archive_mode_thread, called with
+        archive_entry_locks[index] already held."""
+        # If init is still running, the cleanup event was already set by
+        # toggle_archive_mode. Wait here until try_init_stream_with_retries
+        # sees it and exits, so we never call cleanup_stream() while init
+        # is mid-flight inside libvlc.
+        deadline = time.time() + 10.0
+        while self.stream_initializing[index] and time.time() < deadline:
+            time.sleep(0.05)
+        if self.stream_initializing[index]:
+            logging.warning(f"Stream {index}: Init did not stop within timeout, proceeding anyway")
+        self.cleanup_stream(index)
+
+        root_path = os.path.normpath(os.path.join(self.archive_dir, f"cam{index+1}"))
+        try:
+            exists = os.path.isdir(root_path)
+        except Exception as e:
+            logging.warning(f"Stream {index}: Error accessing archive directory {root_path}: {e}")
+            exists = False
+
+        def finish():
+            loading_shown.set()
+            if not self.is_archive_mode[index]:
+                # User toggled back out while we were waiting
+                return
+            if not exists:
+                self.archive_canvas[index].delete("all")
+                panel_width, panel_height = self.panel_sizes[index]
+                self.archive_canvas[index].create_text(
+                    panel_width // 2, panel_height // 2,
+                    text="Archive directory not found", fill="white", font=("arial", -16)
+                )
+                return
+            self.pagination_state[index] = {root_path: 0}
+            self.current_archive_path[index] = root_path
+            self.render_archive_view(index)
+
+        self.root.after(0, finish)
+
+
     def get_cached_thumbnail(self, thumbnail_path, width, height):
         """Load and resize an archive thumbnail, caching the resulting
         PhotoImage so repeated renders (page changes, navigation,
@@ -2142,8 +2347,9 @@ class tapoStreamer:
         cam_index = path.find("/cam")
         if cam_index != -1:
             location = path[cam_index:].replace("/", " / ")
+            location = re.sub(r'(?i)\bcam(\d+)\b', lambda m: 'CAM ' + m.group(1), location).upper()
             self.archive_canvas[index].create_text(
-                80, 25, anchor="w", text=f"{location}", fill="white", font=("arial", -16)
+                80, 25, anchor="w", text=f"{location}", fill="white", font=(self.archive_font, -17)
             )
 
         # Render items for the current page
@@ -2172,7 +2378,7 @@ class tapoStreamer:
                 folder_id = self.archive_canvas[index].create_image(x + item_width // 2, y + icon_size // 2, image=folder_img)
                 if day_match:
                     text_id = self.archive_canvas[index].create_text(
-                        x + item_width // 2, y + icon_size + 10, text=item, fill="white", font=("arial", -17), anchor="n"
+                        x + item_width // 2, y + icon_size + 10, text=item, fill="white", font=(self.archive_font, -17), anchor="n"
                     )
                 else:
                     text_id = self.archive_canvas[index].create_text(
@@ -2281,7 +2487,7 @@ class tapoStreamer:
 
                 label = f"{item.split('_')[1].replace('-', ':')} {item.split('_')[2].split('.')[0].replace('-', '')}"
                 text_id = self.archive_canvas[index].create_text(
-                    x + item_width // 2, y + (thumbnail_height if use_thumbnails else icon_size) + 10, text=label, fill="white", font=("arial", -17), anchor="n"
+                    x + item_width // 2, y + (thumbnail_height if use_thumbnails else icon_size) + 10, text=label, fill="white", font=(self.archive_font, -17), anchor="n"
                 )
 
                 # Bind click and hover events for video image and text
@@ -2359,9 +2565,9 @@ class tapoStreamer:
             self.archive_canvas[index].create_text(
                 pagination_x,
                 pagination_y,
-                text=f"Page {current_page + 1}/{total_pages}",
+                text=f"PAGE {current_page + 1}/{total_pages}",
                 fill="white",
-                font=("arial", -14),
+                font=(self.archive_font, -17),
                 anchor="center"
             )
         else:
@@ -2412,6 +2618,7 @@ class tapoStreamer:
             except Exception:
                 pass
             self.help_overlay = None
+            self.root.focus_set()
             return
 
         overlay = tk.Toplevel(self.root)
@@ -2440,6 +2647,16 @@ class tapoStreamer:
             ]),
         ]
 
+        reliability_info = [
+            ("Max Retry Attempts",    f"{self.max_retry_attempts}",          "Attempts before marking stream as failed"),
+            ("Initial Backoff",       f"{self.initial_backoff_delay}s",       "Wait before first retry; doubles each attempt (max 30s)"),
+            ("Drop Window",           f"{int(self.drop_window)}s",            "Sliding window used to count unstable polling ticks"),
+            ("Drop Threshold",        f"{self.drop_threshold} ticks",         "Bad ticks within the window before downgrading"),
+            ("Downgrade Cooldown",    f"{int(self.downgrade_cooldown)}s",     "Minimum gap between quality switches"),
+            ("Stability Period",      f"{int(self.stability_period)}s",       "Drop-free time on LQ before attempting HQ revert"),
+            ("No-Frame Timeout",      f"{self.no_frame_timeout}s",            "Seconds with no frames before stream is marked failed"),
+        ]
+
         container = tk.Frame(overlay, bg="#222222", padx=30, pady=24,
                               highlightbackground="#555555", highlightthickness=1)
         container.pack()
@@ -2461,6 +2678,19 @@ class tapoStreamer:
                 desc_label = tk.Label(row, text=desc, bg="#222222", fg="#cccccc",
                                        font=("arial", 11), anchor="w")
                 desc_label.pack(side="left", padx=(10, 0))
+
+        # Stream reliability section
+        tk.Label(container, text="Stream Reliability  —  current settings",
+                 bg="#222222", fg="#4a90d9", font=("arial", 13, "bold")).pack(anchor="w", pady=(16, 4))
+        rel_grid = tk.Frame(container, bg="#222222")
+        rel_grid.pack(anchor="w", fill="x")
+        for r_idx, (label, value, tip) in enumerate(reliability_info):
+            tk.Label(rel_grid, text=label, bg="#222222", fg="#cccccc",
+                     font=("arial", 10), width=22, anchor="w").grid(row=r_idx, column=0, sticky="w", pady=1)
+            tk.Label(rel_grid, text=value, bg="#222222", fg="white",
+                     font=("consolas", 10, "bold"), width=12, anchor="w").grid(row=r_idx, column=1, sticky="w", padx=(6, 0), pady=1)
+            tk.Label(rel_grid, text=tip, bg="#222222", fg="#777777",
+                     font=("arial", 10, "italic"), anchor="w").grid(row=r_idx, column=2, sticky="w", padx=(10, 0), pady=1)
 
         hint_label = tk.Label(container, text="Press H, F1, or click anywhere to close",
                                bg="#222222", fg="#777777", font=("arial", 10, "italic"))
@@ -3174,7 +3404,16 @@ class tapoStreamer:
 
     def cleanup_archive_mode(self, index):
         """Clean up archive mode state and UI for the specified stream index."""
-        try:            
+        try:
+            # Stop and release any VLC player playing a clip BEFORE
+            # destroying the Tk widget it's embedded in (vlc_frame, a
+            # child of self.labels[index]). Destroying the widget first
+            # leaves libvlc's vout thread holding an XID for a window
+            # that no longer exists, causing a BadWindow X error on its
+            # next draw.
+            if self.media_players[index]:
+                self.cleanup_stream(index)
+
             # Destroy all child widgets in self.labels[index]
             for widget in self.labels[index].winfo_children():
                 widget.destroy()
