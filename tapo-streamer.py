@@ -292,7 +292,6 @@ class tapoStreamer:
         self.labels = [None] * 4
         self.drop_timestamps = [[] for _ in range(4)]
         self.fullscreen_buttons = [None] * 4
-        self.fullscreen_images = [None] * 4
         self.exit_fullscreen_button = None
         self.exit_fullscreen_image = None
 
@@ -317,18 +316,13 @@ class tapoStreamer:
         self.ptz_buttons = []
         self.ptz_images = []
         self.archive_buttons = [None] * 4
-        self.archive_images = [None] * 4
         self.archive_canvas = [None] * 4
         self.back_buttons = [None] * 4
         self.exit_buttons = [None] * 4
         self.pause_buttons = [None] * 4
         self.speed_buttons = [None] * 4
-        self.pause_images = [None] * 4
-        self.speed_images = [None] * 4
         self.replay_buttons = [None] * 4
-        self.replay_images = [None] * 4
         self.rewind_buttons = [None] * 4
-        self.rewind_images = [None] * 4
         self.audio_buttons = [None] * 4
         # Per-stream mute state for archive/event playback. Starts muted;
         # the user explicitly unmutes via the audio toggle button.
@@ -354,6 +348,9 @@ class tapoStreamer:
         # completion.  Points into the in-memory events list so mutating it
         # also updates the list.
         self.current_playing_event = None
+        # Tracks root.after() IDs for delayed event clip launches so they
+        # can be cancelled if the user exits event mode before they fire.
+        self._pending_event_afters = []
         # Events button widget — created in build_config_panel, kept here so
         # its visibility can be toggled when the config setting changes.
         self.events_button = None
@@ -1518,6 +1515,14 @@ class tapoStreamer:
         if self.event_mode:
             playing = self.event_active_cams - self.event_done_cams
             if playing:
+                # Cancel any pending delayed clip launches before stopping
+                # players so no new playback starts after cleanup.
+                for _after_id in self._pending_event_afters:
+                    try:
+                        self.root.after_cancel(_after_id)
+                    except Exception:
+                        pass
+                self._pending_event_afters.clear()
                 # Force-finish every cam that still has an active player.
                 # Mark them all as done first so the last cam's completion
                 # check inside _on_event_clip_ended sees a full done set and
@@ -1681,14 +1686,12 @@ class tapoStreamer:
                         state="disabled" if not self.enable_fullscreen_buttons else "normal"
                     )
                     self.fullscreen_buttons[i].bind("<Button-1>", lambda e, idx=i: logging.debug(f"Clicked fullscreen_{idx} button"))
-                    self.fullscreen_images[i] = img
                     logging.debug(f"Created fullscreen button for stream {i}")
 
             # Initialize archive button if needed
             if self.is_fullscreen and self.fullscreen_index is not None:
                 if not self.archive_buttons[self.fullscreen_index]:
                     img = self.icon_cache["disk"]
-                    self.archive_images[self.fullscreen_index] = img
                     self.archive_buttons[self.fullscreen_index] = tk.Button(
                         self.config_panel, image=img, bg="#222222", bd=0, cursor="hand2",
                         command=lambda idx=self.fullscreen_index: self.toggle_archive_mode(idx)
@@ -1823,11 +1826,9 @@ class tapoStreamer:
             panel.place(x=x, y=y, width=initial_width, height=initial_height)
             self.panel_sizes[i] = (initial_width, initial_height)
             # Use cached archive image
-            self.archive_images[i] = self.icon_cache["disk"]
             self.archive_buttons[i] = None  # Created in build_config_panel
             self.archive_canvas[i] = tk.Canvas(panel, bg="#222222", highlightthickness=0)
             # Use cached fullscreen image
-            self.fullscreen_images[i] = self.icon_cache["fullscreen"]
             self.fullscreen_buttons[i] = None  # Initialized later
 
         # Set initial label bindings
@@ -3323,10 +3324,6 @@ class tapoStreamer:
         self.replay_buttons[index] = None
         self.rewind_buttons[index] = None
         self.audio_buttons[index] = None
-        self.pause_images[index] = None
-        self.speed_images[index] = None
-        self.replay_images[index] = None
-        self.rewind_images[index] = None
 
         # Reset playback state
         self.playback_speeds[index] = 1.0
@@ -3577,6 +3574,16 @@ class tapoStreamer:
         libvlc players.
         """
         self.event_mode = False
+
+        # Cancel any root.after() callbacks that haven't fired yet
+        # (delayed clip launches from _start_event_playback and
+        # inter-clip gaps from _on_event_clip_ended).
+        for _after_id in self._pending_event_afters:
+            try:
+                self.root.after_cancel(_after_id)
+            except Exception:
+                pass
+        self._pending_event_afters.clear()
 
         # If a single-cam event pushed us into fullscreen, return to grid view.
         if getattr(self, '_event_entered_fullscreen', False):
@@ -4099,13 +4106,14 @@ class tapoStreamer:
                 self.play_archive_video(ci, first_path)
             else:
                 logging.info(f"Cam {ci + 1}: delaying event playback start by {delay_ms}ms")
-                self.root.after(
+                _after_id = self.root.after(
                     delay_ms,
                     lambda c=ci, p=first_path: (
                         self._event_transfer_audio(c),
                         self.play_archive_video(c, p)
                     )
                 )
+                self._pending_event_afters.append(_after_id)
               
     def _on_event_clip_ended(self, index):
         """Called (on main thread via root.after) when a clip finishes in event mode.
@@ -4138,13 +4146,14 @@ class tapoStreamer:
             adjusted_gap_ms = int(gap_ms / speed)
             if adjusted_gap_ms > 0:
                 self.labels[index].configure(image="", text=f"Cam {index + 1}", fg="#888888", bg="black")
-                self.root.after(
+                _after_id = self.root.after(
                     adjusted_gap_ms,
                     lambda i=index, p=next_path: (
                         self._event_transfer_audio(i),
                         self.play_archive_video(i, p)
                     )
                 )
+                self._pending_event_afters.append(_after_id)
             else:
                 self._event_transfer_audio(index)
                 self.play_archive_video(index, next_path)
@@ -4236,7 +4245,6 @@ class tapoStreamer:
                 command=lambda: self.toggle_pause(index)
             )
             self.pause_buttons[index].image = pause_img
-            self.pause_images[index] = pause_img
 
             speed_img = self.icon_cache["speed"]  # Use cached icon
             self.speed_buttons[index] = tk.Button(
@@ -4248,7 +4256,6 @@ class tapoStreamer:
                 command=lambda: self.cycle_speed(index)
             )
             self.speed_buttons[index].image = speed_img
-            self.speed_images[index] = speed_img
 
             replay_img = self.icon_cache["replay"]  # Use cached icon
             self.replay_buttons[index] = tk.Button(
@@ -4260,7 +4267,6 @@ class tapoStreamer:
                 command=lambda: self.replay_video(index)
             )
             self.replay_buttons[index].image = replay_img
-            self.replay_images[index] = replay_img
 
             rewind_img = self.icon_cache["rewind"]  # Use cached icon
             self.rewind_buttons[index] = tk.Button(
@@ -4272,7 +4278,6 @@ class tapoStreamer:
                 command=lambda: self.rewind_video(index)
             )
             self.rewind_buttons[index].image = rewind_img
-            self.rewind_images[index] = rewind_img
 
             self.current_archive_path[index] = video_path
             self.exit_buttons[index].place(relx=0.0, rely=0.0, x=20, y=4, anchor="nw")
@@ -4403,7 +4408,6 @@ class tapoStreamer:
         new_icon = self.icon_cache["play" if self.is_paused[index] else "pause"]  # Use cached icon
         self.pause_buttons[index].configure(image=new_icon)
         self.pause_buttons[index].image = new_icon
-        self.pause_images[index] = new_icon
 
         if self.media_players[index]:
             try:
@@ -4472,7 +4476,6 @@ class tapoStreamer:
                     new_icon = self.icon_cache["pause"]
                 self.pause_buttons[index].configure(image=new_icon)
                 self.pause_buttons[index].image = new_icon
-                self.pause_images[index] = new_icon
                 logging.info(f"Stream {index}: Rewound video by 10 seconds to {new_time/1000:.1f}s at 1x speed")
             except Exception as e:
                 logging.error(f"Error rewinding video for stream {index}: {e}")
@@ -4498,7 +4501,6 @@ class tapoStreamer:
                     new_icon = self.icon_cache["pause"]
                 self.pause_buttons[index].configure(image=new_icon)
                 self.pause_buttons[index].image = new_icon
-                self.pause_images[index] = new_icon
                 logging.info(f"Stream {index}: Replayed video at 1x speed")
             except Exception as e:
                 logging.error(f"Error replaying video for stream {index}: {e}")
@@ -4921,17 +4923,8 @@ class tapoStreamer:
             if self.back_buttons[index]:
                 self.back_buttons[index].place_forget()
 
-            # Reset player control buttons and images
-            self.exit_buttons[index] = None
-            self.pause_buttons[index] = None
-            self.speed_buttons[index] = None
-            self.replay_buttons[index] = None
-            self.rewind_buttons[index] = None
-            self.audio_buttons[index] = None
-            self.pause_images[index] = None
-            self.speed_images[index] = None
-            self.replay_images[index] = None
-            self.rewind_images[index] = None
+            # Reset player control button refs
+            self._reset_clip_buttons(index)
 
             # Reset archive state
             self.is_archive_mode[index] = False
@@ -4990,13 +4983,20 @@ class tapoStreamer:
 
     def cleanup(self):
         self.enable_ptz_buttons()
-        self.running = False
 
-        # Safety-net flush in case the app is closed mid-video (e.g. window
-        # close button) without going through go_back's own save.
+        # Signal all background threads to stop before touching any VLC
+        # object. Threads check self.running and stream_cleanup_events;
+        # setting both here gives them the earliest possible notice so
+        # they are less likely to be mid-libvlc-call when we release.
+        self.running = False
+        for i in range(4):
+            self.stream_cleanup_events[i].set()
+
+        # Safety-net flush in case the app is closed mid-video.
         if self.watch_progress_dirty:
             self.save_watch_progress()
 
+        # Destroy the help overlay (pure Tk, no VLC involvement).
         if self.help_overlay is not None:
             try:
                 self.help_overlay.destroy()
@@ -5004,63 +5004,79 @@ class tapoStreamer:
                 pass
             self.help_overlay = None
 
-        for i in range(4):
-            if self.vlc_instances[i]:
-                try:
-                    self.vlc_instances[i].release()
-                    logging.info(f"Stream {i}: Released VLC instance")
-                except Exception as e:
-                    logging.error(f"Stream {i}: Error releasing VLC instance: {e}")
-                self.vlc_instances[i] = None
-
-        # Stop all streams and mute audio
-        for i in range(4):
+        # Cancel any pending event after() callbacks.
+        for _after_id in getattr(self, "_pending_event_afters", []):
             try:
-                self.cleanup_stream(i)
+                self.root.after_cancel(_after_id)
+            except Exception:
+                pass
+        self._pending_event_afters = []
 
-            except Exception as e:
-                logging.error(f"Error during shutdown of stream {i}: {e}")
-
-        self.onvif_cams.clear()
-
-        for i in range(4):
-            try:
-                if self.archive_canvas[i]:
-                    self.archive_canvas[i].destroy()
-                if self.back_buttons[i]:
-                    self.back_buttons[i].destroy()
-                if self.exit_buttons[i]:
-                    self.exit_buttons[i].destroy()
-                if self.pause_buttons[i]:
-                    self.pause_buttons[i].destroy()
-                if self.speed_buttons[i]:
-                    self.speed_buttons[i].destroy()
-                if self.replay_buttons[i]:
-                    self.replay_buttons[i].destroy()
-                if self.rewind_buttons[i]:
-                    self.rewind_buttons[i].destroy()
-                if self.audio_buttons[i]:
-                    self.audio_buttons[i].destroy()
-                self.archive_canvas[i] = None
-                self.back_buttons[i] = None
-                self.exit_buttons[i] = None
-                self.pause_buttons[i] = None
-                self.speed_buttons[i] = None
-                self.replay_buttons[i] = None
-                self.rewind_buttons[i] = None
-                self.audio_buttons[i] = None
-            except Exception as e:
-                logging.error(f"Error cleaning up UI for stream {i}: {e}")
-
-        # Clean up config panel and all buttons
-        self.cleanup_config_panel()
-
-        time.sleep(0.5)
+        # ── VLC teardown on a background thread ──────────────────────────
+        # player.stop() / instance.release() can block for several seconds
+        # on Windows while libvlc drains its decode thread. Running this
+        # off the main thread keeps the Tk event loop alive so Windows
+        # does not mark the window as "not responding".
+        #
+        # Withdraw the window immediately so the user sees it gone, then
+        # let the background thread finish and schedule root.destroy().
         try:
-            self.root.destroy()
-            logging.info("Shutdown completed")
-        except Exception as e:
-            logging.error(f"Error destroying Tkinter root: {e}")
+            self.root.withdraw()
+        except Exception:
+            pass
+
+        def _vlc_teardown():
+            # Stop and release every stream. cleanup_stream() handles
+            # the stream_cleanup_events signal, player.stop(),
+            # player.release(), and instance.release() in one place.
+            # Do NOT also release vlc_instances[] separately above or
+            # we get a double-free (the previous bug).
+            for i in range(4):
+                try:
+                    self.cleanup_stream(i)
+                except Exception as e:
+                    logging.error(f"Error during shutdown of stream {i}: {e}")
+
+            self.onvif_cams.clear()
+
+            # Hand off Tk widget destruction back to the main thread.
+            self.root.after(0, _tk_teardown)
+
+        def _tk_teardown():
+            for i in range(4):
+                try:
+                    if self.archive_canvas[i]:
+                        self.archive_canvas[i].destroy()
+                    if self.back_buttons[i]:
+                        self.back_buttons[i].destroy()
+                    if self.exit_buttons[i]:
+                        self.exit_buttons[i].destroy()
+                    if self.pause_buttons[i]:
+                        self.pause_buttons[i].destroy()
+                    if self.speed_buttons[i]:
+                        self.speed_buttons[i].destroy()
+                    if self.replay_buttons[i]:
+                        self.replay_buttons[i].destroy()
+                    if self.rewind_buttons[i]:
+                        self.rewind_buttons[i].destroy()
+                    if self.audio_buttons[i]:
+                        self.audio_buttons[i].destroy()
+                    self.archive_canvas[i] = None
+                    self.back_buttons[i] = None
+                    self._reset_clip_buttons(i)
+                except Exception as e:
+                    logging.error(f"Error cleaning up UI for stream {i}: {e}")
+
+            self.cleanup_config_panel()
+
+            try:
+                self.root.destroy()
+                logging.info("Shutdown completed")
+            except Exception as e:
+                logging.error(f"Error destroying Tkinter root: {e}")
+
+        import threading as _threading
+        _threading.Thread(target=_vlc_teardown, daemon=True).start()
 
 if __name__ == "__main__":
     try:
