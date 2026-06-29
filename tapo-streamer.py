@@ -1750,6 +1750,16 @@ class tapoStreamer:
                         self.fullscreen_buttons[i].lift()
                     elif self.fullscreen_buttons[i]:
                         self.fullscreen_buttons[i].place_forget()
+                for i in range(4):
+                    # Fullscreen buttons are never shown in event mode: single-cam
+                    # events auto-enter fullscreen, multi-cam events don't support it.
+                    if (self.enable_fullscreen_buttons and self.ips[i] and not self.is_archive_mode[i]
+                            and not self.event_mode):
+                        self.fullscreen_buttons[i].configure(state="normal")
+                        self.fullscreen_buttons[i].place(relx=1.0, rely=1.0, x=-35, y=-35, anchor="se")
+                        self.fullscreen_buttons[i].lift()
+                    elif self.fullscreen_buttons[i]:
+                        self.fullscreen_buttons[i].place_forget()
 
             logging.debug("Config panel built successfully")
         except Exception as e:
@@ -4096,7 +4106,7 @@ class tapoStreamer:
                         self.play_archive_video(c, p)
                     )
                 )
-
+              
     def _on_event_clip_ended(self, index):
         """Called (on main thread via root.after) when a clip finishes in event mode.
 
