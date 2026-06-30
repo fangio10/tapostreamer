@@ -16,14 +16,6 @@ from datetime import datetime
 import shlex
 import argparse
 
-# When running as a PyInstaller-frozen binary on Linux, the bootloader's
-# LD_LIBRARY_PATH override can interfere with libvlc's normal discovery
-# and relative plugin path resolution, causing either "no function
-# libvlc_new" (lib not found) or libvlc loading with zero plugins
-# (e.g. "unknown option --rtsp-tcp"). We rely on the system-installed
-# VLC, so point python-vlc explicitly at the system libvlc and plugin
-# directory before importing the bindings, which load libvlc at import
-# time. Covers common Fedora/RHEL and Debian/Ubuntu layouts.
 if getattr(sys, 'frozen', False) and sys.platform.startswith('linux'):
     _lib_candidates = (
         '/usr/lib64/libvlc.so.5',                       # Fedora/RHEL
@@ -33,10 +25,10 @@ if getattr(sys, 'frozen', False) and sys.platform.startswith('linux'):
         '/usr/local/lib/libvlc.so.5',
     )
     _plugin_candidates = (
-        '/usr/lib64/vlc/plugins',                       # Fedora/RHEL
-        '/usr/lib/x86_64-linux-gnu/vlc/plugins',        # Debian/Ubuntu amd64
-        '/usr/lib/i386-linux-gnu/vlc/plugins',          # Debian/Ubuntu i386
-        '/usr/lib/aarch64-linux-gnu/vlc/plugins',       # Debian/Ubuntu arm64
+        '/usr/lib64/vlc/plugins',
+        '/usr/lib/x86_64-linux-gnu/vlc/plugins',
+        '/usr/lib/i386-linux-gnu/vlc/plugins',
+        '/usr/lib/aarch64-linux-gnu/vlc/plugins',
         '/usr/lib/vlc/plugins',
         '/usr/local/lib/vlc/plugins',
     )
@@ -51,10 +43,9 @@ if getattr(sys, 'frozen', False) and sys.platform.startswith('linux'):
 
 import vlc
 import ctypes
-from ctypes import Structure
 
 def debounce(wait):
-    """Decorator to debounce a function."""
+    # Decorator to debounce a function.
     def decorator(fn):
         def debounced(*args, **kwargs):
             def call_it():
@@ -66,26 +57,6 @@ def debounce(wait):
         return debounced
     return decorator
 
-# Define libvlc_media_stats_t structure
-class libvlc_media_stats_t(Structure):
-    _fields_ = [
-        ("i_read_bytes", ctypes.c_int),
-        ("f_input_bitrate", ctypes.c_float),
-        ("i_demux_read_bytes", ctypes.c_int),
-        ("f_demux_bitrate", ctypes.c_float),
-        ("i_demux_corrupted", ctypes.c_int),
-        ("i_demux_discontinuity", ctypes.c_int),
-        ("i_decoded_video", ctypes.c_int),
-        ("i_decoded_audio", ctypes.c_int),
-        ("i_displayed_pictures", ctypes.c_int),
-        ("i_lost_pictures", ctypes.c_int),
-        ("i_played_abuffers", ctypes.c_int),
-        ("i_lost_abuffers", ctypes.c_int),
-        ("i_sent_packets", ctypes.c_int),
-        ("i_sent_bytes", ctypes.c_int),
-        ("f_send_bitrate", ctypes.c_float),
-    ]
-
 class tapoStreamer:
     DEFAULT_VLC_PARAMS = [
         "--avcodec-hw=any",
@@ -95,10 +66,6 @@ class tapoStreamer:
 
     @classmethod
     def parse_vlcparams(cls, raw, default=None):
-        """Parse a VLC params string or list into a validated list of
-        '--option' style flags. Falls back to default (or
-        DEFAULT_VLC_PARAMS) on empty/invalid input. Centralized so
-        config-load and the settings-dialog save path can't drift."""
         default = default if default is not None else cls.DEFAULT_VLC_PARAMS
         try:
             if isinstance(raw, (list, tuple)):
@@ -114,28 +81,11 @@ class tapoStreamer:
 
     MIN_WIDTH = 1340
     MIN_HEIGHT = 720
-
-    # Candidate fonts offered in Options > General > Font, in priority
-    # order. These aren't assumed to be installed - _init_font_choices()
-    # checks each one against the fonts Tk can actually see on this
-    # machine and only offers ones that are really there. The list spans
-    # Windows 10/11's built-in fonts (Verdana, Tahoma, Arial, Segoe UI)
-    # and the default font packages on recent Linux desktops (DejaVu
-    # Sans ships on Debian/Ubuntu/Fedora; Liberation Sans on
-    # Fedora/RHEL; Noto Sans on GNOME-based distros), so most users see
-    # a handful of real, working choices on either OS.
     FONT_CANDIDATES = ["Verdana", "Tahoma", "Arial", "Segoe UI", "DejaVu Sans", "Liberation Sans", "Noto Sans"]
     FONT_FALLBACK = "Helvetica"  # Always resolvable as a Tk built-in alias, even if nothing above matches
 
     def check_decoder_availability(self):
-        """Best-effort check for a hardware-capable ffmpeg h264 decoder.
-
-        On some distros (e.g. stock Fedora), ffmpeg ships only the
-        software-only libopenh264 decoder, which silently prevents VLC
-        hardware acceleration from ever engaging (--avcodec-hw=any has
-        nothing to accelerate). This is just a diagnostic log line so
-        users aren't left guessing why GPU usage never moves.
-        """
+        # Best-effort check for a hardware-capable ffmpeg h264 decoder.
         if not sys.platform.startswith("linux"):
             return
         try:
@@ -166,34 +116,27 @@ class tapoStreamer:
             logging.debug(f"Could not check ffmpeg decoder availability: {e}")
 
     def _setup_logging(self, debug_mode):
-        """Configure logging based on debug mode."""
-        # Clear existing handlers to avoid duplicates
         logging.getLogger().handlers = []
 
         if not debug_mode:
-            # Disable logging by setting a null handler and high level
             null_handler = logging.NullHandler()
             logging.getLogger().addHandler(null_handler)
-            logging.getLogger().setLevel(logging.CRITICAL + 1)  # Higher than any log level
+            logging.getLogger().setLevel(logging.CRITICAL + 1)
             return
 
-        # Configure logging for debug mode
         log_level = logging.DEBUG
         log_dir = os.path.dirname(self.config_file)
         log_file = os.path.join(log_dir, "tapo-streamer.log")
 
-        # Configure root logger
         logging.basicConfig(
             filename=log_file,
             level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
 
-        # Configure zeep logger to suppress ISO8601Error
         zeep_logger = logging.getLogger('zeep')
-        zeep_logger.propagate = False  # Prevent propagation to root logger
+        zeep_logger.propagate = False 
 
-        # Additional safety for zeep.xsd.types.simple
         logging.getLogger('zeep.xsd.types.simple').setLevel(logging.WARNING)
 
         logging.info("Logging initialized with level DEBUG")
@@ -207,7 +150,6 @@ class tapoStreamer:
         # --- Configuration Setup ---
         self.root = root
         self.root.title("Tapo Streamer")
-
         self.root.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
 
         # Set up configuration directory
@@ -222,8 +164,8 @@ class tapoStreamer:
         # Initialize debug mode and logging
         self.debug_mode = args.debug
         self.speed_cycle = [1.0, 2.0, 4.0, 8.0]
-        self._init_font_choices()  # Needs self.root; must run before load_config validates ui_font
-        self.load_config()  # Load config to set debug_mode if not overridden
+        self._init_font_choices()
+        self.load_config()
         if not args.debug and hasattr(self, 'config_debug'):
             self.debug_mode = self.config_debug
         self._setup_logging(self.debug_mode)
@@ -257,34 +199,11 @@ class tapoStreamer:
         self.is_fullscreen = False
         self.fullscreen_index = None
         self.help_overlay = None
-
-        # Each stream owns its own dedicated libvlc Instance rather than
-        # sharing one. The previous shared self.vlc_instance was silently
-        # overwritten by whichever stream's init_stream() ran last when
-        # multiple streams initialized concurrently (e.g. all 4 on exiting
-        # archive mode), orphaning the other streams' instances with no
-        # reference while their players were still using them. Any cleanup
-        # could then release an instance another stream's player depended
-        # on, causing a libvlc use-after-free/segfault. Per-stream instances
-        # make that race structurally impossible.
         self.vlc_instances = [None] * 4
-        self.stream_initializing = [False] * 4  # From prior refactor
-        self.stream_init_lock = threading.Lock()  # From prior refactor
-        self.stream_cleanup_events = [threading.Event() for _ in range(4)]  # Events for cleanup signaling
-        # Locks that serialise archive-entry background threads against
-        # concurrent toggle_archive_mode(exit) calls on the main thread.
-        # Acquiring the lock in _enter_archive_mode_thread and checking it
-        # in the exit path prevents two threads calling cleanup_stream()
-        # simultaneously, which causes a libvlc segfault.
+        self.stream_initializing = [False] * 4
+        self.stream_init_lock = threading.Lock()
+        self.stream_cleanup_events = [threading.Event() for _ in range(4)]
         self.archive_entry_locks = [threading.Lock() for _ in range(4)]
-        # True while a toggle_archive_mode(index) transition (entry or exit)
-        # is in flight for that stream. Set/cleared only on the main thread,
-        # so checking-and-setting it at the very top of toggle_archive_mode
-        # is atomic with respect to other UI events (clicks, right-clicks) -
-        # there is no scheduling window for a second click to sneak in
-        # between "set is_archive_mode" and "start the background thread",
-        # which was the root cause of the grid-view rapid-toggle segfault
-        # and hang (clicking again before the transition is fully resolved).
         self.archive_transitioning = [False] * 4
         self.media_players = [None] * 4
         self.streams = [""] * 4
@@ -312,7 +231,6 @@ class tapoStreamer:
         self.pagination_state = [{} for _ in range(4)]
 
         self.config_button = None
-        self.ptz_buttons_disabled = False
         self.ptz_buttons = []
         self.ptz_images = []
         self.archive_buttons = [None] * 4
@@ -324,48 +242,19 @@ class tapoStreamer:
         self.replay_buttons = [None] * 4
         self.rewind_buttons = [None] * 4
         self.audio_buttons = [None] * 4
-        # Per-stream mute state for archive/event playback. Starts muted;
-        # the user explicitly unmutes via the audio toggle button.
         self.archive_audio_muted = [True] * 4
-
-        # --- Event mode state ---
-        # True while the event overlay is open and we are playing back or
-        # waiting between clips.  Checked by monitor_vlc_playback and go_back
-        # to route end-of-clip handling away from the normal archive navigation.
         self.event_mode = False
-        # Per-cam ordered queue of absolute clip paths to play for the current
-        # event.  Populated by _start_event_playback before the first clip on
-        # each cam is launched; each entry is popped when that clip finishes.
+
         self.event_clip_queues = [[] for _ in range(4)]
-        # Cams that have at least one clip in the current event.
         self.event_active_cams = set()
-        # Cams whose clip queue is exhausted (including cams with no clips).
         self.event_done_cams = set()
-        # Weak reference to the event overlay Frame so _on_event_clip_ended
-        # can re-show it without the overlay having to register itself globally.
         self.event_overlay = None
-        # The event dict currently playing, used to mark it as played on
-        # completion.  Points into the in-memory events list so mutating it
-        # also updates the list.
         self.current_playing_event = None
-        # Tracks root.after() IDs for delayed event clip launches so they
-        # can be cancelled if the user exits event mode before they fire.
         self._pending_event_afters = []
-        # Events button widget — created in build_config_panel, kept here so
-        # its visibility can be toggled when the config setting changes.
         self.events_button = None
         self.events_button_image = None
-        # Per-stream dict: video_path -> {"position": seconds, "duration": seconds}.
-        # Populated live during playback (monitor_vlc_playback) and persisted
-        # to watch_progress.json so progress survives an app restart. Writes
-        # are debounced - only flushed when a video is exited (go_back) or on
-        # app shutdown, not on every playback poll tick, to avoid hammering
-        # disk for something that updates once a second per stream.
         self.watch_progress = {index: {} for index in range(4)}
         self.watch_progress_dirty = False
-        # Folders the user has opened this session, just for the dimmed-icon
-        # visual cue. Navigation history isn't worth persisting across
-        # restarts the way video progress is, so this stays in-memory only.
         self.visited_folders = {index: set() for index in range(4)}
 
         self.panel_sizes = [(0, 0)] * 4
@@ -408,17 +297,9 @@ class tapoStreamer:
             "audio_off": self.create_icon("audio_off"),
         }
 
-        # Cache for per-weekday folder icons (Mon/Tue/.../Sun x
-        # clicked/unclicked), generated lazily by get_day_folder_icon.
         self.day_folder_icon_cache = {}
-
-        # --- Final Setup ---
-        # Cache of loaded/resized archive thumbnails, keyed by
-        # (path, width, height) -> PhotoImage, to avoid re-decoding and
-        # re-resizing JPEGs from disk on every render_archive_view call
-        # (page changes, navigation, fullscreen toggles, etc.)
         self.thumbnail_cache = {}
-        self.thumbnail_cache_order = []  # insertion order for simple LRU eviction
+        self.thumbnail_cache_order = []
         self.thumbnail_cache_max = 200
 
         self.load_watch_progress()
@@ -427,17 +308,7 @@ class tapoStreamer:
         self.root.after(0, lambda: threading.Thread(target=self.start_streams, daemon=True).start())
 
     def _init_font_choices(self):
-        """Build the list of fonts offered in Options > General > Font.
-
-        Rather than hardcoding font names that may not exist on a given
-        machine (Arial in particular is rarely installed on stock
-        Linux), this probes FONT_CANDIDATES against the fonts Tk can
-        actually see here (tkinter.font.families()) and only offers
-        ones that are genuinely available, so a selection always
-        renders correctly. One bold-styled entry is always appended,
-        built from the first available font, so there's always a
-        higher-contrast option regardless of platform.
-        """
+        # Build the list of fonts offered in Options > General > Font.
         try:
             installed = {name.lower() for name in tkfont.families(self.root)}
         except Exception as e:
@@ -457,15 +328,7 @@ class tapoStreamer:
         self.font_choice_labels = [choice["label"] for choice in self.font_choices]
 
     def app_font(self, size, style=None):
-        """Return a Tk font tuple using the user's selected UI font.
-
-        Used everywhere the app draws its own text (Options panel,
-        archive browser, overlays) so the Font setting applies
-        consistently rather than just in one place. Pass `style`
-        ("bold"/"italic"/"bold italic") to force a weight regardless of
-        the user's selection (e.g. section headers); omit it to use the
-        weight from the selected font itself (e.g. "Verdana Bold").
-        """
+        # Return a Tk font tuple using the user's selected UI font.
         choice = next(
             (c for c in self.font_choices if c["label"] == self.ui_font),
             self.font_choices[0]
@@ -478,12 +341,6 @@ class tapoStreamer:
         self.username = ""
         self.password = ""
         self.archive_dir = ""
-        # Cached result of the last os.path.exists(archive_dir) probe.
-        # build_config_panel() reads this instead of calling
-        # os.path.exists() directly, since that can block for seconds on
-        # a spun-down disk or slow network mount and was previously
-        # freezing the main thread on every config panel rebuild.
-        # Optimistically True so the button shows before the first probe.
         self.ips = ["", "", "", ""]
         self.hq_enabled = [True] * 4
         self.audio_enabled = [True] * 4
@@ -541,10 +398,6 @@ class tapoStreamer:
                 self.stability_period = config.get("stability_period", self.stability_period)
                 raw_no_frame = config.get("no_frame_timeout", self.no_frame_timeout)
                 self.no_frame_timeout = float(raw_no_frame) if raw_no_frame > 5 else 15.0
-                # "ui_font" replaces the older "archive_font" key (read as a
-                # fallback for migration). Validated against the fonts
-                # actually available on this machine; anything unrecognized
-                # falls back to the first validated choice.
                 raw_font = config.get("ui_font", config.get("archive_font", self.ui_font))
                 matched_font = next(
                     (label for label in self.font_choice_labels if label.lower() == str(raw_font).lower()),
@@ -558,7 +411,7 @@ class tapoStreamer:
                     self.event_overlap_window_mins = 1
                 self.exclusive_archive_audio = bool(config.get("exclusive_archive_audio", self.exclusive_archive_audio))
 
-                # Validate saved_window_size
+                # Validate settings
                 try:
                     if self.saved_window_size != "fullscreen":
                         width, height = map(int, self.saved_window_size.split("x"))
@@ -569,11 +422,9 @@ class tapoStreamer:
                     logging.warning(f"Invalid saved_window_size: {self.saved_window_size}, using default 1340x720")
                     self.saved_window_size = "1340x720"
 
-                # Validate ptz_resolution
                 if not isinstance(self.ptz_resolution, int) or self.ptz_resolution < 1 or self.ptz_resolution > 5:
                     self.ptz_resolution = 3
 
-                # Validate default_playback_speed
                 try:
                     self.default_playback_speed = float(self.default_playback_speed)
                     if self.default_playback_speed not in self.speed_cycle:
@@ -583,7 +434,6 @@ class tapoStreamer:
                     logging.warning(f"Invalid default_playback_speed: {self.default_playback_speed}, using default 1.0")
                     self.default_playback_speed = 1.0
 
-                # Validate new settings
                 if self.max_retry_attempts < 1:
                     logging.warning(f"Invalid max_retry_attempts: {self.max_retry_attempts}, using default 3")
                     self.max_retry_attempts = 5
@@ -658,13 +508,7 @@ class tapoStreamer:
             messagebox.showerror("Error", f"Failed to save configuration: {e}")
 
     def load_watch_progress(self):
-        """Load per-video watch progress from disk into self.watch_progress.
-
-        The file maps cam index (as a string key, since JSON object keys must
-        be strings) to {video_path: {"position": s, "duration": s}}. Missing
-        or corrupt files are treated as "no progress yet" rather than an
-        error - this is convenience data, not critical config.
-        """
+        #Load per-video watch progress from disk into self.watch_progress.
         if not os.path.exists(self.watch_progress_file):
             return
         try:
@@ -688,9 +532,7 @@ class tapoStreamer:
             logging.warning(f"Failed to load watch progress from {self.watch_progress_file}: {e}")
 
     def save_watch_progress(self):
-        """Persist self.watch_progress to disk. Cheap enough to call on
-        natural checkpoints (exiting a video, app shutdown) but deliberately
-        NOT called on every playback poll tick - see watch_progress_dirty."""
+        # Persist self.watch_progress to disk.
         try:
             data = {str(index): self.watch_progress[index] for index in range(4)}
             os.makedirs(os.path.dirname(self.watch_progress_file), exist_ok=True)
@@ -767,7 +609,6 @@ class tapoStreamer:
         row = add_section_header(core_frame, "Cameras", row)
 
         # Camera IPs and settings
-        # Each cam row: label + IP entry in col 0-1, then HQ/Audio/PTZ checkboxes in a sub-frame in col 1
         ip_entries = []
         hq_checkboxes = []
         audio_checkboxes = []
@@ -799,7 +640,6 @@ class tapoStreamer:
 
         row = add_section_header(core_frame, "Playback & Display", row)
 
-        # PTZ Travel
         tk.Label(core_frame, text="PTZ Travel:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         ptz_resolution_var = tk.IntVar(value=self.ptz_resolution)
         ttk.Combobox(
@@ -807,7 +647,6 @@ class tapoStreamer:
         ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
-        # Playback Speed
         tk.Label(core_frame, text="Playback Speed:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         playback_speed_var = tk.DoubleVar(value=self.default_playback_speed)
         ttk.Combobox(
@@ -815,10 +654,6 @@ class tapoStreamer:
         ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
-        # Font - applies wherever the app draws its own text (this dialog,
-        # the archive browser, overlays), not just archive mode. Options are
-        # limited to fonts actually installed on this machine; see
-        # _init_font_choices().
         tk.Label(core_frame, text="Font:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         font_var = tk.StringVar(value=self.ui_font)
         ttk.Combobox(
@@ -828,21 +663,18 @@ class tapoStreamer:
 
         row = add_section_header(core_frame, "Behavior", row)
 
-        # Show Stream Buttons
         fullscreen_buttons_var = tk.BooleanVar(value=self.enable_fullscreen_buttons)
         ttk.Checkbutton(core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var).grid(
             row=row, column=0, **SPAN
         )
         row += 1
 
-        # Resume Playback
         resume_playback_var = tk.BooleanVar(value=self.resume_playback)
         ttk.Checkbutton(
             core_frame, text="Resume Archive Clips From Last Position", variable=resume_playback_var
         ).grid(row=row, column=0, **SPAN)
         row += 1
 
-        # Exclusive archive audio
         exclusive_audio_var = tk.BooleanVar(value=self.exclusive_archive_audio)
         ttk.Checkbutton(
             core_frame, text="Exclusive Archive Audio (unmuting one clip mutes others)",
@@ -850,14 +682,12 @@ class tapoStreamer:
         ).grid(row=row, column=0, **SPAN)
         row += 1
 
-        # Motion Triggered Events
         motion_events_var = tk.BooleanVar(value=self.motion_triggered_events)
         ttk.Checkbutton(core_frame, text="Motion Triggered Events", variable=motion_events_var).grid(
             row=row, column=0, **SPAN
         )
         row += 1
 
-        # Event Overlap Window — enabled/disabled inline with the checkbox above
         tk.Label(core_frame, text="Event Overlap Window:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
         event_overlap_var = tk.IntVar(value=self.event_overlap_window_mins)
         overlap_combo = ttk.Combobox(
@@ -874,7 +704,6 @@ class tapoStreamer:
         motion_events_var.trace_add("write", _update_overlap_state)
         _update_overlap_state()
 
-        # Save Window Size
         save_window_size_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(core_frame, text="Save Window Size", variable=save_window_size_var).grid(
             row=row, column=0, **SPAN
@@ -1001,7 +830,6 @@ class tapoStreamer:
         )
         row += 1
 
-        # Debug mode
         debug_var = tk.BooleanVar(value=self.config_debug)
         ttk.Checkbutton(advanced_frame, text="Enable Debug Logging", variable=debug_var).grid(
             row=row, column=0, **SPAN
@@ -1169,7 +997,7 @@ class tapoStreamer:
         self.build_config_panel()
 
         dialog.destroy()
-        threading.Thread(target=self.restart_streams, daemon=True).start()
+        threading.Thread(target=self.start_streams, daemon=True).start()
 
     def check_network_connectivity(self, ip_input):
         """
@@ -1367,23 +1195,10 @@ class tapoStreamer:
             draw.polygon([(10, 30), (20, 15), (30, 30)], fill="white")
         elif icon_type == "down":
             draw.polygon([(10, 10), (20, 25), (30, 10)], fill="white")
-        elif icon_type == "fullscreen":
-            draw.rectangle((8, 8, 32, 32), outline="white", width=2)
-            draw.line((10, 10, 13, 10), fill="white", width=2)
-            draw.line((10, 10, 10, 13), fill="white", width=2)
-            draw.line((30, 30, 27, 30), fill="white", width=2)
-            draw.line((30, 30, 30, 27), fill="white", width=2)
-        elif icon_type == "minimize":
-            draw.rectangle((8, 8, 32, 32), outline="white", width=2)
-            draw.line((8, 20, 32, 20), fill="white", width=2)
-            draw.line((20, 8, 20, 32), fill="white", width=2)
         return ImageTk.PhotoImage(img)
 
     def get_day_folder_icon(self, day_abbrev, is_clicked):
-        """Return a (cached) folder icon with the weekday abbreviation
-        (Mon/Tue/Wed/...) drawn prominently across the front, so day
-        folders are easier to scan at a glance than a bare date label.
-        """
+        #Return a (cached) folder icon with the weekday abbreviation.
         cache_key = (day_abbrev, is_clicked)
         cached = self.day_folder_icon_cache.get(cache_key)
         if cached is not None:
@@ -1401,14 +1216,11 @@ class tapoStreamer:
                 return (0, 0, 0, int(255 * opacity))
             return color
 
-        # Folder body, same shape as the standard folder icon.
         draw.rectangle((20, 30, 80, 80), fill=adjust_color("white", opacity),
                         outline=adjust_color("white", opacity), width=3)
         draw.polygon([(20, 30), (30, 20), (40, 20), (40, 30)],
                       fill=adjust_color("white", opacity), outline=adjust_color("white", opacity), width=3)
 
-        # Weekday abbreviation drawn across the front of the folder in a
-        # dark color so it stands out against the white folder body.
         font = None
         for font_path in (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -1442,7 +1254,7 @@ class tapoStreamer:
         return photo
 
     def bind_stream_label(self, index):
-        """Bind the label for a given stream based on its state."""
+        # Bind the label for a given stream based on its state.
         try:
             # Unbind any existing click event
             self.labels[index].unbind("<Button-1>")
@@ -1453,13 +1265,9 @@ class tapoStreamer:
                 self.labels[index].bind("<Button-1>", lambda event, idx=index: self.retry_stream_connection(idx))
                 logging.debug(f"Stream {index}: Bound label to retry connection (failed state)")
             else:
-                # In event mode the quadrants show archive clips or idle
-                # placeholders — fullscreen-zoom on click is a live-view
-                # behaviour and should not fire here.
                 if self.event_mode:
                     logging.debug(f"Stream {index}: No binding applied (event mode active)")
                     return
-                # Bind fullscreen action if fullscreen buttons are disabled and stream is active
                 if not self.enable_fullscreen_buttons and self.streams[index]:
                     self.labels[index].bind("<Button-1>", lambda event, idx=index: self.handle_stream_click(idx))
                     logging.debug(f"Stream {index}: Bound label to fullscreen action")
@@ -1469,7 +1277,6 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Failed to bind stream label: {e}")
 
     def update_label_bindings(self):
-        """Update label bindings for all streams based on their state and fullscreen button settings."""
         for i in range(4):
             self.bind_stream_label(i)
         logging.debug("Updated label bindings for all streams")
@@ -1502,16 +1309,7 @@ class tapoStreamer:
     def exit_fullscreen(self, event=None):
         logging.debug(f"exit_fullscreen called (event={event}, is_fullscreen={self.is_fullscreen})")
 
-        # --- Event mode intercept ---
-        # Right-click has a two-step dismissal in event mode so the user
-        # doesn't accidentally drop all the way back to live in one click.
-        #
-        # Step 1 — clips are playing in at least one quadrant:
-        #   Stop all active players, black out their quadrants, re-show the
-        #   event listing.  Equivalent to all clips ending simultaneously.
-        #
-        # Step 2 — overlay is visible (no clips playing):
-        #   Exit event mode entirely and return to live streams.
+        # Event mode intercept
         if self.event_mode:
             playing = self.event_active_cams - self.event_done_cams
             if playing:
@@ -1524,23 +1322,13 @@ class tapoStreamer:
                         pass
                 self._pending_event_afters.clear()
                 # Force-finish every cam that still has an active player.
-                # Mark them all as done first so the last cam's completion
-                # check inside _on_event_clip_ended sees a full done set and
-                # triggers the overlay re-show rather than thinking there are
-                # still cams outstanding.
                 for i in list(playing):
                     self.event_clip_queues[i] = []   # clear queue so no next-clip is started
                     self.event_done_cams.add(i)
                     self.cleanup_stream(i)
                     for widget in self.labels[i].winfo_children():
                         widget.destroy()
-                    self.exit_buttons[i]   = None
-                    self.pause_buttons[i]  = None
-                    self.speed_buttons[i]  = None
-                    self.replay_buttons[i] = None
-                    self.rewind_buttons[i] = None
-                    self.audio_buttons[i]  = None
-                    self.video_ended[i]    = False
+                    self._reset_clip_buttons(i)
                     self.labels[i].configure(image="", text=f"Cam {i + 1}", fg="#888888", bg="black")
 
                 # All cams are now done — mark event played and re-show overlay
@@ -1576,20 +1364,10 @@ class tapoStreamer:
         if self.is_fullscreen:
             idx = self.fullscreen_index
 
-            # While fullscreen and in archive mode, right-click acts as a
-            # "back" button: playing clip -> clip browser -> folder
-            # browser -> live feed (still fullscreen). go_back() handles
-            # each of these steps, including stopping any playing clip
-            # before its embedded VLC widget is destroyed (avoiding a
-            # BadWindow X error) and exiting archive mode entirely once
-            # at the archive root (which returns to the live view while
-            # remaining fullscreen).
             if idx is not None and idx >= 0 and self.is_archive_mode[idx]:
                 self.go_back(idx)
                 return
 
-            # Already on the live feed: right-click exits fullscreen to
-            # the grid view.
             self.is_fullscreen = False
             self.fullscreen_index = -1
 
@@ -1615,9 +1393,8 @@ class tapoStreamer:
             # Initialize config panel if not exists
             if not self.config_panel:
                 self.config_panel = tk.Frame(self.root, bg="#222222", width=60)
-                logging.debug("Created new config panel")
 
-            # Initialize PTZ buttons if not exists
+            # Initialize buttons if not exists
             if not self.ptz_buttons:
                 self.ptz_buttons = []
                 self.ptz_images = []
@@ -1630,9 +1407,7 @@ class tapoStreamer:
                     button.bind("<ButtonRelease-1>", lambda event, d=direction: self.stop_ptz_move(d))
                     self.ptz_buttons.append(button)
                     self.ptz_images.append(img)
-                    logging.debug(f"Created PTZ button: {direction}")
 
-            # Initialize exit fullscreen button
             if not self.exit_fullscreen_button:
                 self.exit_fullscreen_image = self.icon_cache["minimize"]
                 self.exit_fullscreen_button = tk.Button(
@@ -1641,9 +1416,7 @@ class tapoStreamer:
                     command=self.exit_fullscreen, cursor="hand2"
                 )
                 self.exit_fullscreen_button.bind("<Button-1>", lambda e: logging.debug("Clicked exit_fullscreen button"))
-                logging.debug("Created exit fullscreen button")
 
-            # Initialize config button
             if not self.config_button:
                 self.config_img = self.icon_cache["config"]
                 self.config_button = tk.Button(
@@ -1652,9 +1425,7 @@ class tapoStreamer:
                     command=self.show_config_dialog, cursor="hand2"
                 )
                 self.config_button.bind("<Button-1>", lambda e: logging.debug("Clicked config button"))
-                logging.debug("Created config button")
 
-            # Initialize archive mode button
             if not self.archive_mode_button:
                 self.archive_mode_image = self.icon_cache["disk"]
                 self.archive_mode_button = tk.Button(
@@ -1663,9 +1434,7 @@ class tapoStreamer:
                     command=self.toggle_all_archive_mode, cursor="hand2"
                 )
                 self.archive_mode_button.bind("<Button-1>", lambda e: logging.debug("Clicked archive mode button"))
-                logging.debug("Created archive mode button")
 
-            # Initialize events button (only relevant when motion_triggered_events is on)
             if not self.events_button:
                 self.events_button_image = self.icon_cache["events"]
                 self.events_button = tk.Button(
@@ -1674,9 +1443,7 @@ class tapoStreamer:
                     command=self.toggle_event_mode, cursor="hand2"
                 )
                 self.events_button.bind("<Button-1>", lambda e: logging.debug("Clicked events button"))
-                logging.debug("Created events button")
 
-            # Initialize fullscreen buttons
             for i in range(4):
                 if not self.fullscreen_buttons[i]:
                     img = self.icon_cache["fullscreen"]
@@ -1686,9 +1453,7 @@ class tapoStreamer:
                         state="disabled" if not self.enable_fullscreen_buttons else "normal"
                     )
                     self.fullscreen_buttons[i].bind("<Button-1>", lambda e, idx=i: logging.debug(f"Clicked fullscreen_{idx} button"))
-                    logging.debug(f"Created fullscreen button for stream {i}")
 
-            # Initialize archive button if needed
             if self.is_fullscreen and self.fullscreen_index is not None:
                 if not self.archive_buttons[self.fullscreen_index]:
                     img = self.icon_cache["disk"]
@@ -1699,7 +1464,6 @@ class tapoStreamer:
                     self.archive_buttons[self.fullscreen_index].bind(
                         "<Button-1>", lambda e, idx=self.fullscreen_index: logging.debug(f"Clicked archive_{idx} button")
                     )
-                    logging.debug(f"Created archive button for stream {self.fullscreen_index}")
 
             # Forget all buttons before re-packing
             for button in self.ptz_buttons + [self.exit_fullscreen_button, self.config_button, self.archive_mode_button] + \
@@ -1726,8 +1490,6 @@ class tapoStreamer:
                 self.config_button.pack(pady=5, padx=10)
             else:
                 # Pack archive mode button only in grid mode if archive_dir is valid.
-                # Disable while any stream is still initializing so a premature
-                # click can't race against a live libvlc player mid-setup.
                 if self.archive_dir:
                     any_initializing = any(self.stream_initializing)
                     self.archive_mode_button.configure(
@@ -1735,9 +1497,6 @@ class tapoStreamer:
                     )
                     self.archive_mode_button.pack(pady=5, padx=10)
                 # Pack events button in grid mode if motion_triggered_events is on
-                # and archive_dir is set (clips needed for scanning).
-                # Disable while any stream is still initializing so a premature
-                # click can't race against a live libvlc player mid-setup.
                 if self.motion_triggered_events and self.archive_dir:
                     any_initializing = any(self.stream_initializing)
                     self.events_button.configure(
@@ -1803,14 +1562,11 @@ class tapoStreamer:
 
 
     def init_ui(self):
-        """
-        Initialize the user interface, applying saved window size and centering.
-        """
-        # Create config_panel
+        # Initialize the user interface, applying saved window size and centering.
+
         self.config_panel = tk.Frame(self.root, bg="#222222", width=60)
         self.config_panel.pack(side="right", fill="y")
         
-        # Create grid_frame
         self.grid_frame = tk.Frame(self.root, bg="#222222")
         self.grid_frame.pack(fill="both", expand=True)
 
@@ -1825,16 +1581,14 @@ class tapoStreamer:
             y = 0 if i in (0, 1) else initial_height + 5
             panel.place(x=x, y=y, width=initial_width, height=initial_height)
             self.panel_sizes[i] = (initial_width, initial_height)
-            # Use cached archive image
+          
             self.archive_buttons[i] = None  # Created in build_config_panel
             self.archive_canvas[i] = tk.Canvas(panel, bg="#222222", highlightthickness=0)
-            # Use cached fullscreen image
+          
             self.fullscreen_buttons[i] = None  # Initialized later
 
-        # Set initial label bindings
         self.update_label_bindings()
 
-        # Apply saved window size and center the window
         self.apply_window_size(self.saved_window_size)
 
         # Key bindings
@@ -1859,15 +1613,8 @@ class tapoStreamer:
         self.root.bind("<Next>", lambda e: self.archive_change_page_shortcut(1))     # Page Down
         self.root.bind("<BackSpace>", lambda e: self.archive_go_back_shortcut())
 
-        # Help overlay
-        self.root.bind("<KeyPress-h>", lambda e: self.toggle_help_overlay())
-        self.root.bind("<KeyPress-H>", lambda e: self.toggle_help_overlay())
-
         # Initialize buttons via build_config_panel
         self.build_config_panel()
-
-    def restart_streams(self):
-        self.start_streams()
 
     def set_audio_state(self, index, mute=True):
         if not self.audio_enabled[index]:
@@ -1902,12 +1649,7 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Failed to update label: {e}")
 
     def try_init_stream_with_retries(self, index):
-        """Attempt to initialize a stream with retries, managing all label updates.
-
-        Quality downgrades made here or by the monitor are session-only: hq_enabled
-        is changed in memory but never saved, so the next app start uses the
-        user-configured value from the config file.
-        """
+        # Attempt to initialize a stream with retries, managing all label updates.
         with self.stream_init_lock:
             if self.stream_initializing[index]:
                 logging.warning(f"Stream {index}: Already initializing, skipping retry")
@@ -1966,12 +1708,6 @@ class tapoStreamer:
                     self.root.after(0, lambda: self.bind_stream_label(index))
                     return True
 
-                # If init_stream failed because we were signalled to abort
-                # (e.g. archive mode was entered), it has already released
-                # its own player. Don't call cleanup_stream() again here —
-                # that responsibility belongs to whoever set the event, and
-                # calling it a second time risks racing with that thread's
-                # own cleanup_stream() call once stream_initializing clears.
                 if self.stream_cleanup_events[index].is_set():
                     logging.info(f"Stream {index}: Init failed due to abort signal, yielding cleanup to signaller")
                     return False
@@ -1986,9 +1722,6 @@ class tapoStreamer:
                     return False
 
                 logging.info(f"Stream {index}: Attempt {attempt+1} failed, retrying in {backoff_delay:.2f}s")
-                # Use the cleanup event as an interruptible sleep — if archive
-                # mode is entered while we are in backoff, the event fires and
-                # we wake immediately instead of waiting the full delay.
                 self.stream_cleanup_events[index].wait(timeout=backoff_delay)
                 backoff_delay = min(backoff_delay * 2, max_backoff)
 
@@ -2003,12 +1736,7 @@ class tapoStreamer:
 
     def build_vlc_instance_args(self, extra_args=None):
         """Build the common libvlc instance argument list, with optional
-        per-call extra args (e.g. archive-specific caching flags).
-
-        Centralizing this avoids the two call sites (live stream init and
-        archive playback) drifting apart - e.g. the --no-xlib /
-        --vout=gl bug where one path was fixed and the other forgotten.
-        """
+        per-call extra args (e.g. archive-specific caching flags). """
         args = [
             '--no-video-title-show',
             '--rtsp-tcp',
@@ -2028,9 +1756,6 @@ class tapoStreamer:
         return args
 
     def _vlc_log_handler(self, data, level, ctx, fmt, args):
-        """libvlc log callback - forwards libvlc's internal log lines into
-        our own logging output so hardware-decode / vout issues are visible
-        without needing to run the vlc CLI manually."""
         try:
             buf = ctypes.create_string_buffer(2048)
             libc = ctypes.CDLL(None)
@@ -2095,23 +1820,12 @@ class tapoStreamer:
             if player.play() == -1:
                 raise RuntimeError("Failed to start VLC player")
 
-            # Mute immediately — audio must never play in grid view.
-            # set_audio_state() can't be used here (it checks stream_initializing
-            # which is True for this stream right now), so call libvlc directly.
             try:
                 player.audio_set_mute(True)
             except Exception:
                 pass
 
             while time.time() - start_wait < timeout:
-                # Abort promptly if cleanup/archive-entry has been signalled.
-                # We release the player we just created right here, rather
-                # than leaving it for the caller, because the thread that
-                # signalled the abort (e.g. _enter_archive_mode_thread_locked)
-                # is waiting on stream_initializing and will proceed to do
-                # its own cleanup the moment this function returns. If we
-                # left the player referenced, two threads would both try to
-                # stop()/release() it, which segfaults libvlc.
                 if self.stream_cleanup_events[index].is_set():
                     logging.info(f"Stream {index}: Abort signal during frame wait, stopping init")
                     try:
@@ -2240,17 +1954,7 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Failed to bind retry connection: {e}")
 
     def monitor_stream(self, index, player):
-        """Monitor a live stream for frame drops and state changes.
-
-        Drop detection uses a single sliding-window list (drop_timestamps) that
-        tracks how many polling intervals within drop_window seconds recorded any
-        dropped frames.  drop_threshold is therefore "N bad polling ticks in the
-        window", not raw frame count — keep that in mind when tuning.
-
-        Quality changes are session-only: hq_enabled is mutated in memory but
-        save_config() is never called here, so the user's configured quality is
-        restored on the next app start.
-        """
+        #Monitor a live stream for frame drops and state changes.
         logging.info(f"Monitoring stream {index}")
 
         last_check = time.time()
@@ -2349,9 +2053,7 @@ class tapoStreamer:
                     self.try_init_stream_with_retries(index)
                     return
 
-                # Auto-revert to HQ (session-only — no save_config)
-                # Requires: auto-revert enabled, currently on LQ, cooldown elapsed,
-                # and no drops at all during the full stability_period.
+                # Auto-revert to HQ
                 if (self.enable_auto_revert_hq
                         and not self.hq_enabled[index]
                         and current_time - last_stream_switch >= self.downgrade_cooldown):
@@ -2377,33 +2079,21 @@ class tapoStreamer:
 
         logging.info(f"Stream {index} monitoring stopped")
 
-    def _disable_stream_action_buttons(self):
-        """Disable the archive-mode and events buttons on the main thread.
-
-        Called before any batch of stream init threads starts so neither
-        button can be clicked while libvlc players are still being set up.
-        Must be called via root.after() when invoked from a background thread.
-        """
+    def _disable_stream_action_buttons(self):        
+        # Disable the archive-mode and events buttons on the main thread.
         if self.archive_mode_button:
             self.archive_mode_button.configure(state="disabled")
         if self.events_button:
             self.events_button.configure(state="disabled")
 
     def _reenable_stream_action_buttons(self):
-        """Re-enable the archive-mode and events buttons on the main thread,
-        respecting whether each feature is actually configured.
-
-        Called via root.after() once all stream init threads have joined.
-        """
         if self.archive_mode_button and self.archive_dir:
             self.archive_mode_button.configure(state="normal")
         if self.events_button and self.motion_triggered_events and self.archive_dir:
             self.events_button.configure(state="normal")
 
     def start_streams(self):
-        # Disable the archive and events buttons for the duration of stream
-        # init so the user can't interact with either before any live libvlc
-        # players exist.  Matches the same guard applied when exiting event mode.
+
         self.root.after(0, self._disable_stream_action_buttons)
 
         threads = []
@@ -2538,10 +2228,6 @@ class tapoStreamer:
         any_archive_mode = any(self.is_archive_mode[i] for i in range(4))
 
         if any_archive_mode:
-            # Exit archive mode for all streams in archive mode. No disk
-            # access required, safe to do synchronously. toggle_archive_mode
-            # silently no-ops for any stream that's mid-transition, so this
-            # loop is safe to call unconditionally.
             for i in range(4):
                 if self.is_archive_mode[i] and not self.archive_transitioning[i]:
                     self.toggle_archive_mode(i, rebuild_ui=False)
@@ -2564,24 +2250,11 @@ class tapoStreamer:
             logging.debug(f"Stream {index}: Toggle archive mode ignored, no archive directory configured")
             return
 
-        # Reject re-entrant calls while a transition is already in flight
-        # for this stream. This check-and-set happens synchronously on the
-        # main thread (toggle_archive_mode is only ever called from Tk
-        # event handlers), so there is no window for a rapid double-click
-        # or click-then-right-click to start a second transition before the
-        # first one has set up its background thread / locks. Without this,
-        # two transitions could interleave their cleanup_stream() calls on
-        # the same libvlc player and segfault, or leave is_archive_mode and
-        # the visible canvas out of sync (the reported hang).
         if self.archive_transitioning[index]:
             logging.debug(f"Stream {index}: Archive transition already in progress, ignoring toggle")
             return
         self.archive_transitioning[index] = True
 
-        # If stream init is in progress, signal it to abort via
-        # stream_cleanup_events. _enter_archive_mode_thread checks this
-        # before calling cleanup_stream() so the two threads never race
-        # on the same libvlc player.
         if self.stream_initializing[index]:
             logging.info(f"Stream {index}: Init in progress, signalling abort for archive toggle")
             self.stream_cleanup_events[index].set()
@@ -2590,12 +2263,6 @@ class tapoStreamer:
         logging.info(f"Stream {index}: Archive mode {'enabled' if self.is_archive_mode[index] else 'disabled'}")
 
         if self.is_archive_mode[index]:
-            # Entering archive mode. Swap to the archive canvas
-            # immediately - cleanup_stream() (stopping/releasing the
-            # live VLC player) and the directory probe both happen on a
-            # background thread, since either can take noticeable time
-            # (libvlc stop/release isn't instant, and a spun-down disk
-            # can take seconds to wake).
             self.labels[index].pack_forget()
             self.archive_canvas[index].pack(fill="both", expand=True)
             self.archive_canvas[index].delete("all")
@@ -2605,9 +2272,6 @@ class tapoStreamer:
             if rebuild_ui:
                 self.build_config_panel()
 
-            # Show "Loading..." immediately so the panel never looks frozen.
-            # Also hide any nav buttons left over from a previous archive session
-            # so they don't appear on top of the loading screen.
             loading_shown = threading.Event()
             if hasattr(self, "nav_buttons") and index < len(self.nav_buttons):
                 for btn in self.nav_buttons[index].values():
@@ -2621,11 +2285,6 @@ class tapoStreamer:
             )
             threading.Thread(target=self._enter_archive_mode_thread, args=(index, loading_shown), daemon=True).start()
         else:
-            # Exiting archive mode. Acquire archive_entry_locks[index] first
-            # so we wait for any in-progress _enter_archive_mode_thread to
-            # finish its cleanup_stream() call before we touch the player.
-            # This prevents the libvlc segfault caused by two threads calling
-            # stop()/release() on the same player simultaneously.
             with self.archive_entry_locks[index]:
                 self.cleanup_archive_mode(index)
 
@@ -2648,30 +2307,13 @@ class tapoStreamer:
             self.archive_transitioning[index] = False
 
     def _enter_archive_mode_thread(self, index, loading_shown):
-        """Background-thread portion of entering archive mode: stop the
-        live VLC player, read the archive directory, then hand off to
-        render_archive_view on the main thread.
-
-        The directory read happens here (off the main thread) so a slow
-        NAS or spun-down HDD doesn't freeze the UI. "Loading..." is shown
-        immediately when archive mode is entered, so there is no need for
-        any special wakeup-detection logic.
-
-        archive_entry_locks[index] is held for the entire duration so that
-        a concurrent exit (right-click while still loading) waits for this
-        thread to finish before calling cleanup_stream(), preventing two
-        threads from releasing the same libvlc player simultaneously.
-        """
         with self.archive_entry_locks[index]:
             self._enter_archive_mode_thread_locked(index, loading_shown)
 
     def _enter_archive_mode_thread_locked(self, index, loading_shown):
         """Actual body of _enter_archive_mode_thread, called with
         archive_entry_locks[index] already held."""
-        # If init is still running, the cleanup event was already set by
-        # toggle_archive_mode. Wait here until try_init_stream_with_retries
-        # sees it and exits, so we never call cleanup_stream() while init
-        # is mid-flight inside libvlc.
+      
         deadline = time.time() + 10.0
         while self.stream_initializing[index] and time.time() < deadline:
             time.sleep(0.05)
@@ -2712,11 +2354,6 @@ class tapoStreamer:
 
 
     def get_cached_thumbnail(self, thumbnail_path, width, height):
-        """Load and resize an archive thumbnail, caching the resulting
-        PhotoImage so repeated renders (page changes, navigation,
-        fullscreen toggles) don't re-decode/re-resize the same JPEG from
-        disk every time. Cache is invalidated if the file's mtime changes.
-        """
         try:
             mtime = os.path.getmtime(thumbnail_path)
         except OSError:
@@ -2740,17 +2377,6 @@ class tapoStreamer:
         return photo
 
     def draw_progress_bar(self, index, x, y, width, height, progress):
-        """Draw a thin YouTube-style red progress bar along the bottom edge
-        of a thumbnail/icon rectangle (x, y, width, height), filled to
-        progress['position'] / progress['duration']. A faint full-width
-        track is drawn first so the unwatched portion is still visible,
-        matching the familiar red-on-grey look.
-
-        The surrounding white border is a 2px outline centered on this same
-        rect, so 1px of it extends inward on every side. The bar is inset by
-        that 1px on the left/right/bottom so it sits flush inside the border
-        rather than drawing over it.
-        """
         BORDER_INSET = 1
         bar_height = 4
         bar_x = x + BORDER_INSET
@@ -2850,7 +2476,7 @@ class tapoStreamer:
 
         # Back button
         if not self.back_buttons[index]:
-            back_img = self.icon_cache["back"]  # Use cached icon
+            back_img = self.icon_cache["back"]
             self.back_buttons[index] = tk.Button(
                 self.archive_canvas[index],
                 image=back_img,
@@ -2935,11 +2561,7 @@ class tapoStreamer:
             progress = self.watch_progress[index].get(full_path)
 
             if os.path.isdir(full_path):
-                # Render folder icon. For day folders (YYYY-MM-DD), show
-                # the weekday abbreviation on the folder itself and the
-                # full date as smaller secondary text below, so the grid
-                # is scannable by day rather than a sea of identical
-                # folder icons with only a date underneath.
+                # Render folder icon. For day folders (YYYY-MM-DD)
                 day_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", item)
                 if day_match:
                     try:
@@ -2965,7 +2587,7 @@ class tapoStreamer:
                 for id_ in (folder_id, text_id):
                     self.archive_canvas[index].tag_bind(
                         id_, "<Button-1>",
-                        lambda e, p=full_path: self.handle_item_click(index, p, self.open_folder)
+                        lambda e, p=full_path: self.open_folder(index, p)
                     )
                     # Bind hover events for hand2 cursor
                     self.archive_canvas[index].tag_bind(
@@ -3004,7 +2626,7 @@ class tapoStreamer:
                             # Bind click and hover events on the thumbnail image itself
                             self.archive_canvas[index].tag_bind(
                                 video_id, "<Button-1>",
-                                lambda e, p=full_path: self.handle_item_click(index, p, self.play_archive_video)
+                                lambda e, p=full_path: self.play_archive_video(index, p)
                             )
                             self.archive_canvas[index].tag_bind(
                                 video_id, "<Enter>",
@@ -3066,7 +2688,7 @@ class tapoStreamer:
                 for id_ in (video_id, text_id):
                     self.archive_canvas[index].tag_bind(
                         id_, "<Button-1>",
-                        lambda e, p=full_path: self.handle_item_click(index, p, self.play_archive_video)
+                        lambda e, p=full_path: self.play_archive_video(index, p)
                     )
                     self.archive_canvas[index].tag_bind(
                         id_, "<Enter>",
@@ -3098,7 +2720,7 @@ class tapoStreamer:
 
             # Previous button
             if "prev" not in self.nav_buttons[index]:
-                prev_img = self.icon_cache["left"]  # Use cached icon
+                prev_img = self.icon_cache["left"]
                 self.nav_buttons[index]["prev"] = tk.Button(
                     self.archive_canvas[index],
                     image=prev_img,
@@ -3113,7 +2735,7 @@ class tapoStreamer:
 
             # Next button
             if "next" not in self.nav_buttons[index]:
-                next_img = self.icon_cache["right"]  # Use cached icon
+                next_img = self.icon_cache["right"]
                 self.nav_buttons[index]["next"] = tk.Button(
                     self.archive_canvas[index],
                     image=next_img,
@@ -3177,112 +2799,6 @@ class tapoStreamer:
             return
         self.go_back(idx)
 
-    def toggle_help_overlay(self):
-        """Show or hide the keyboard-shortcuts panel.
-
-        The panel is a plain tk.Frame placed over self.grid_frame with
-        place() + lift() so it stays strictly inside the app window.
-        Triggered by H.
-        """
-        if self.help_overlay is not None:
-            try:
-                self.help_overlay.destroy()
-            except Exception:
-                pass
-            self.help_overlay = None
-            self.root.focus_set()
-            return
-
-        # Build the panel as a Frame inside the grid area so it never
-        # floats outside the app window.
-        overlay = tk.Frame(
-            self.grid_frame, bg="#222222",
-            highlightbackground="#555555", highlightthickness=1
-        )
-
-        shortcuts = [
-            ("General", [
-                ("H", "Show or hide this help overlay"),
-                ("Q", "Quit the application"),
-                ("Alt+Enter  /  Shift", "Toggle fullscreen"),
-            ]),
-            ("Navigation", [
-                ("Up", "Enter fullscreen (current/last stream)"),
-                ("Down  /  Right-click", "Exit fullscreen"),
-                ("Left  /  Right", "Switch to previous / next stream (fullscreen)"),
-            ]),
-            ("Archive Browser (fullscreen)", [
-                ("Page Up  /  Page Down", "Previous / next page of clips"),
-                ("Backspace", "Go back / return to browser"),
-            ]),
-        ]
-
-        reliability_info = [
-            ("Max Retry Attempts",    f"{self.max_retry_attempts}",          "Attempts before marking stream as failed"),
-            ("Initial Backoff",       f"{self.initial_backoff_delay}s",       "Wait before first retry; doubles each attempt (max 30s)"),
-            ("Drop Window",           f"{int(self.drop_window)}s",            "Sliding window used to count unstable polling ticks"),
-            ("Drop Threshold",        f"{self.drop_threshold} ticks",         "Bad ticks within the window before downgrading"),
-            ("Downgrade Cooldown",    f"{int(self.downgrade_cooldown)}s",     "Minimum gap between quality switches"),
-            ("Stability Period",      f"{int(self.stability_period)}s",       "Drop-free time on LQ before attempting HQ revert"),
-            ("No-Frame Timeout",      f"{self.no_frame_timeout}s",            "Seconds with no frames before stream is marked failed"),
-        ]
-
-        container = tk.Frame(overlay, bg="#222222", padx=30, pady=24)
-        container.pack()
-
-        title_label = tk.Label(container, text="Keyboard Shortcuts", bg="#222222", fg="white",
-                                font=self.app_font(18, "bold"))
-        title_label.pack(anchor="w", pady=(0, 14))
-
-        for section_title, items in shortcuts:
-            section_label = tk.Label(container, text=section_title, bg="#222222", fg="#4a90d9",
-                                      font=self.app_font(13, "bold"))
-            section_label.pack(anchor="w", pady=(10, 4))
-            for key, desc in items:
-                row = tk.Frame(container, bg="#222222")
-                row.pack(anchor="w", fill="x")
-                key_label = tk.Label(row, text=key, bg="#222222", fg="white",
-                                      font=("consolas", 11, "bold"), width=22, anchor="w")
-                key_label.pack(side="left")
-                desc_label = tk.Label(row, text=desc, bg="#222222", fg="#cccccc",
-                                       font=self.app_font(11), anchor="w")
-                desc_label.pack(side="left", padx=(10, 0))
-
-        # Stream reliability section
-        tk.Label(container, text="Stream Reliability  —  current settings",
-                 bg="#222222", fg="#4a90d9", font=self.app_font(13, "bold")).pack(anchor="w", pady=(16, 4))
-        rel_grid = tk.Frame(container, bg="#222222")
-        rel_grid.pack(anchor="w", fill="x")
-        for r_idx, (label, value, tip) in enumerate(reliability_info):
-            tk.Label(rel_grid, text=label, bg="#222222", fg="#cccccc",
-                     font=self.app_font(10), width=22, anchor="w").grid(row=r_idx, column=0, sticky="w", pady=1)
-            tk.Label(rel_grid, text=value, bg="#222222", fg="white",
-                     font=("consolas", 10, "bold"), width=12, anchor="w").grid(row=r_idx, column=1, sticky="w", padx=(6, 0), pady=1)
-            tk.Label(rel_grid, text=tip, bg="#222222", fg="#777777",
-                     font=self.app_font(10, "italic"), anchor="w").grid(row=r_idx, column=2, sticky="w", padx=(10, 0), pady=1)
-
-        hint_label = tk.Label(container, text="Press H, or click anywhere to close",
-                               bg="#222222", fg="#777777", font=self.app_font(10, "italic"))
-        hint_label.pack(anchor="w", pady=(16, 0))
-
-        # Close on click anywhere in the panel.  Keyboard shortcuts H
-        # already route through self.root bindings so no duplicate binds needed.
-        for widget in (overlay, container, title_label, hint_label):
-            widget.bind("<Button-1>", lambda e: self.toggle_help_overlay())
-
-        # Measure content then centre over the grid area
-        overlay.update_idletasks()
-        overlay.place(relx=0.5, rely=0.5, anchor="center")
-        overlay.lift()
-
-        self.help_overlay = overlay
-
-    def handle_item_click(self, index, path, callback):
-        # Progress (and thus "has this been watched") is now tracked
-        # automatically by monitor_vlc_playback once playback starts, so
-        # there's nothing to record here - just dispatch to the real handler.
-        callback(index, path)
-
     def open_folder(self, index, path):
         self.visited_folders[index].add(os.path.normpath(path))
         self.current_archive_path[index] = path
@@ -3291,22 +2807,24 @@ class tapoStreamer:
             self.pagination_state[index][path] = 0
         self.render_archive_view(index)
 
+    def _reset_clip_buttons(self, index):
+        """Null out per-stream clip-playback button refs and reset playback flags."""
+        self.exit_buttons[index]   = None
+        self.pause_buttons[index]  = None
+        self.speed_buttons[index]  = None
+        self.replay_buttons[index] = None
+        self.rewind_buttons[index] = None
+        self.audio_buttons[index]  = None
+        self.video_ended[index]    = False
+
     def go_back(self, index):
         # In event mode the exit button should follow the clip queue rather
         # than navigating the archive folder tree or tearing down the whole
-        # session.  _on_event_clip_ended handles all three cases:
-        #   - more clips in this cam's queue  → play next clip
-        #   - queue empty, other cams still playing → black out this quadrant
-        #   - queue empty, all cams done       → re-show event listing
-        # It also calls cleanup_stream(index) internally so the still-running
-        # VLC instance is stopped before the next action regardless of which
-        # branch is taken.
+        # session.
         if self.event_mode:
             self._on_event_clip_ended(index)
             return
 
-        # Flush watch progress before tearing down the player, while we still
-        # have current_archive_path[index] pointing at the video we were on.
         if self.watch_progress_dirty:
             self.save_watch_progress()
 
@@ -3317,18 +2835,10 @@ class tapoStreamer:
         for widget in self.labels[index].winfo_children():
             widget.destroy()
 
-        # Reset button and image references
-        self.exit_buttons[index] = None
-        self.pause_buttons[index] = None
-        self.speed_buttons[index] = None
-        self.replay_buttons[index] = None
-        self.rewind_buttons[index] = None
-        self.audio_buttons[index] = None
-
-        # Reset playback state
+        # Reset button refs and playback state
+        self._reset_clip_buttons(index)
         self.playback_speeds[index] = 1.0
         self.is_paused[index] = False
-        self.video_ended[index] = False
 
         # Handle navigation
         if not self.current_archive_path[index]:
@@ -3378,42 +2888,18 @@ class tapoStreamer:
         self.archive_canvas[index].pack(fill="both", expand=True)
         self.render_archive_view(index)
 
-    # =========================================================================
-    # Events feature
-    # =========================================================================
-
     def _events_dir(self):
-        """Return the base directory where per-day event JSON files are stored."""
+        # Return the base directory where per-day event JSON files are stored.
         config_dir = os.path.dirname(self.config_file)
         return os.path.join(config_dir, "events")
 
     def _events_path(self, date):
-        """Return the full path for a given date's event JSON file.
+        # Return the full path for a given date's event JSON file.
 
-        Layout: <config_dir>/events/<YYYY>/<YYYYMMDD>.json
-        Matches the year-subfolder structure agreed during design to avoid
-        an unbounded flat directory as years accumulate.
-        """
         return os.path.join(self._events_dir(), str(date.year), date.strftime("%Y%m%d") + ".json")
 
     def _scan_events_for_date(self, date):
-        """Scan archive clips for date and cluster them into events.
-
-        Reads filenames only — no file I/O beyond os.listdir.  Clips whose
-        name does not match the expected pattern are silently skipped.
-
-        Clustering algorithm (gap-based):
-          1. Collect all clips from all cams with a parseable timestamp.
-          2. Sort the complete list by clip start time.
-          3. Walk the list, keeping a running "event window end".  A clip that
-             starts within event_overlap_window_mins of the current window end
-             extends the window and is merged into the current event cluster.
-             A clip that starts after the window end opens a new event.
-          4. Events that involve only a single cam are still kept — they are
-             valid single-camera events.
-
-        Returns a list of event dicts in the JSON schema described above.
-        """
+        # Scan archive clips for date and cluster them into events.
         from datetime import timedelta
 
         date_str = date.strftime("%Y-%m-%d")
@@ -3512,12 +2998,7 @@ class tapoStreamer:
         return events
 
     def _load_or_scan_events(self, date):
-        """Return the events list for date, using cached JSON for past days.
-
-        For today's date the cache is always regenerated because new clips may
-        have appeared since the last open.  For past dates the JSON is trusted
-        as immutable once written.
-        """
+        # Return the events list for date, using cached JSON for past days.
         from datetime import date as _date
         json_path = self._events_path(date)
         today = _date.today()
@@ -3559,25 +3040,9 @@ class tapoStreamer:
             self._open_event_overlay()
 
     def _exit_event_mode(self):
-        """Tear down event mode and return all quadrants to live streams.
-
-        All live streams were stopped when entering event mode, so every cam
-        with a configured IP needs to be restarted here, not just the ones
-        that played archive clips.
-
-        Streams are restarted concurrently (one thread per cam, matching the
-        app-startup pattern in start_streams) rather than sequentially, so
-        all four cams begin their network handshake at the same time.  Both
-        the archive and events buttons are disabled for the duration and
-        re-enabled on the main thread once every init thread has finished,
-        preventing a re-entry click from racing against still-initializing
-        libvlc players.
-        """
+        # Tear down event mode and return all quadrants to live streams.
         self.event_mode = False
 
-        # Cancel any root.after() callbacks that haven't fired yet
-        # (delayed clip launches from _start_event_playback and
-        # inter-clip gaps from _on_event_clip_ended).
         for _after_id in self._pending_event_afters:
             try:
                 self.root.after_cancel(_after_id)
@@ -3647,9 +3112,6 @@ class tapoStreamer:
         self.event_mode = True
         self.build_config_panel()   # re-pack to reflect active state
 
-        # Stop all live streams and blank every quadrant with a per-cam
-        # placeholder so no live video plays in the background while the
-        # overlay is open.  All streams are restarted in _exit_event_mode.
         for i in range(4):
             if self.is_archive_mode[i]:
                 self.cleanup_archive_mode(i)
@@ -3752,17 +3214,6 @@ class tapoStreamer:
         rows_frame.bind("<Configure>", _on_rows_configure)
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_win, width=e.width))
 
-        # ---- Mouse-wheel scrolling ----
-        # Tk delivers scroll events to whichever widget the pointer is
-        # directly over — not necessarily the canvas.  The helper below
-        # walks the rows_frame subtree and binds all widgets so scrolling
-        # works regardless of whether the pointer is over a label, checkbox,
-        # separator, or the canvas background.  It is called once after the
-        # initial render and again at the end of every _render_rows() refresh.
-        #
-        # Linux:   Button-4 = scroll up,  Button-5 = scroll down
-        # Win/Mac: MouseWheel delta is ±120 per notch (positive = up)
-
         def _on_scroll_linux(event):
             canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
 
@@ -3803,11 +3254,6 @@ class tapoStreamer:
                          font=self.app_font(10, "italic")).pack(pady=20)
                 return
 
-            # Unbind <Configure> while building rows.  Every pack() call
-            # resizes rows_frame which fires <Configure> which calls
-            # canvas.bbox("all"), forcing Tk to flush pending geometry to
-            # the screen immediately — making rows paint one at a time.
-            # Suppress that, build everything, then fire one final update.
             rows_frame.unbind("<Configure>")
 
             play_img   = self.icon_cache["play"]
@@ -3818,11 +3264,6 @@ class tapoStreamer:
                 row_f = tk.Frame(rows_frame, bg=row_bg)
                 row_f.pack(fill="x", pady=1)
 
-                # Use Labels rather than Buttons for the action icons.
-                # tk.Button initialises against the system theme background
-                # before the bg= override takes effect, causing a brief blue
-                # flash on X11/GNOME.  Labels apply bg immediately at
-                # construction time and are faster to create in bulk.
                 pb = tk.Label(row_f, image=play_img, bg=row_bg, cursor="hand2")
                 pb.pack(side="left", padx=(6, 2), pady=4)
 
@@ -3920,8 +3361,6 @@ class tapoStreamer:
 
                 ttk.Separator(rows_frame, orient="horizontal").pack(fill="x")
 
-            # All rows built — rebind Configure, do one layout pass, then
-            # attach scroll bindings to the full rows_frame subtree.
             rows_frame.bind("<Configure>", _on_rows_configure)
             rows_frame.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -3950,16 +3389,8 @@ class tapoStreamer:
         _place_overlay()
 
     def _event_transfer_audio(self, index):
-        """Transfer audio to cam index during event playback.
+        # Transfer audio to cam index during event playback.
 
-        If exclusive_archive_audio is enabled, mutes every other active
-        event cam (updating both the libvlc player and the button icon if
-        the button already exists) and marks index as unmuted so
-        play_archive_video creates its button in the audio_on state.
-
-        If exclusive_archive_audio is disabled this is a no-op — each cam
-        keeps whatever mute state it had.
-        """
         if not self.exclusive_archive_audio:
             return
         for i in range(4):
@@ -3980,21 +3411,8 @@ class tapoStreamer:
         self.archive_audio_muted[index] = False
 
     def _start_event_playback(self, event, played_label_widget, date, events_list):
-        """Kick off coordinated playback for event across all enabled cams.
+        # Kick off coordinated playback for event across all enabled cams.
 
-        Populates event_clip_queues with bare path strings (no seek needed —
-        every clip plays from its own beginning).  Multi-cam synchronisation
-        is achieved by delaying the start of each cam by the difference
-        between that cam's first clip_start and the event's global start,
-        so they join playback at the same wall-clock moment as when recorded.
-
-        Example:
-          event.start  = 01:10:00
-          cam1 clip_start = 01:10:00  → starts immediately  (0s delay)
-          cam2 clip_start = 01:10:05  → starts after 5s     (5s delay)
-          cam1 plays its first 5 seconds alone, then cam2 joins — exactly
-          as it appeared on the live view when the motion was detected.
-        """
         self.current_playing_event = event
         self.event_clip_queues  = [[] for _ in range(4)]
         self.event_active_cams  = set()
@@ -4006,8 +3424,6 @@ class tapoStreamer:
         except Exception:
             event_start_dt = None
 
-        # Build queues and collect per-cam start delays before launching
-        # anything, so all root.after() calls are registered atomically.
         cam_launches = []  # list of (ci, first_path, delay_ms)
 
         for cam_key, cam_data in event["cams"].items():
@@ -4018,12 +3434,6 @@ class tapoStreamer:
                 continue
             ci = int(cam_key) - 1
 
-            # Queue entries are (path, gap_ms) where gap_ms is the wall-clock
-            # gap between the end of the previous clip and the start of this
-            # one on the same cam.  For the first clip gap_ms is always 0
-            # (the initial cross-cam delay is handled separately below).
-            # Subsequent clips inherit any recording gap so pauses between
-            # clips on the same cam are preserved during playback.
             queue = []
             for clip_idx, clip in enumerate(clips):
                 if clip_idx == 0:
@@ -4040,9 +3450,6 @@ class tapoStreamer:
             self.event_clip_queues[ci] = queue
             self.event_active_cams.add(ci)
 
-            # Cross-cam start delay: how long after the event start this cam's
-            # first clip begins.  Divided by playback speed so the offset
-            # shrinks proportionally when playing at 2x/4x/8x.
             speed = max(1.0, self.default_playback_speed)
             if event_start_dt is not None:
                 try:
@@ -4070,9 +3477,6 @@ class tapoStreamer:
         self._event_date_for_save  = date
         self._event_list_for_save  = events_list
 
-        # Single-cam events play in fullscreen so the clip fills the screen
-        # rather than being confined to one quadrant.  Track whether we
-        # entered fullscreen here so _exit_event_mode can restore the grid.
         self._event_entered_fullscreen = False
         if len(self.event_active_cams) == 1:
             ci_solo = next(iter(self.event_active_cams))
@@ -4083,23 +3487,15 @@ class tapoStreamer:
                 self.update_layout()
                 self.build_config_panel()
 
-        # Enter archive mode for each active cam upfront so the quadrant
-        # switches to its label widget before any delayed play fires.
         for ci, _, _ in cam_launches:
             if not self.is_archive_mode[ci]:
                 self.is_archive_mode[ci] = True
                 self.archive_canvas[ci].pack_forget()
                 self.labels[ci].pack(fill="both", expand=True)
 
-        # In event mode all cams start muted; audio is transferred to each
-        # cam as it begins playing via _event_transfer_audio, so the most
-        # recently started clip always carries the audio.
         for ci, _, _ in cam_launches:
             self.archive_audio_muted[ci] = True
 
-        # Schedule each cam's first clip, delayed by its offset.
-        # _event_transfer_audio is called just before play_archive_video so
-        # the button is created with the correct icon on the first render.
         for ci, first_path, delay_ms in cam_launches:
             if delay_ms == 0:
                 self._event_transfer_audio(ci)
@@ -4116,32 +3512,19 @@ class tapoStreamer:
                 self._pending_event_afters.append(_after_id)
               
     def _on_event_clip_ended(self, index):
-        """Called (on main thread via root.after) when a clip finishes in event mode.
-
-        If more clips remain for this cam, play the next one.  Otherwise mark
-        this cam done.  When all active cams are done, mark the event played
-        and re-show the overlay.
-        """
+        # Called (on main thread via root.after) when a clip finishes in event mode.
         if not self.event_mode:
             return  # User exited event mode early — nothing to do
 
         if self.event_clip_queues[index]:
-            # More clips in queue for this cam — play next.
-            # Transfer audio to this cam (it's the most recently started).
+
             next_path, gap_ms = self.event_clip_queues[index].pop(0)
-            # Clean up the just-ended player before starting the next one
+
             self.cleanup_stream(index)
             for widget in self.labels[index].winfo_children():
                 widget.destroy()
-            self.exit_buttons[index] = None
-            self.pause_buttons[index] = None
-            self.speed_buttons[index] = None
-            self.replay_buttons[index] = None
-            self.rewind_buttons[index] = None
-            self.audio_buttons[index] = None
-            self.video_ended[index] = False
-            # Apply the inter-clip gap, scaled by the current playback speed
-            # so a 30s gap at 2x only delays 15s of real time.
+            self._reset_clip_buttons(index)
+
             speed = max(1.0, self.playback_speeds[index])
             adjusted_gap_ms = int(gap_ms / speed)
             if adjusted_gap_ms > 0:
@@ -4162,13 +3545,7 @@ class tapoStreamer:
             self.cleanup_stream(index)
             for widget in self.labels[index].winfo_children():
                 widget.destroy()
-            self.exit_buttons[index] = None
-            self.pause_buttons[index] = None
-            self.speed_buttons[index] = None
-            self.replay_buttons[index] = None
-            self.rewind_buttons[index] = None
-            self.audio_buttons[index] = None
-            self.video_ended[index] = False
+            self._reset_clip_buttons(index)
             self.labels[index].configure(image="", text=f"Cam {index + 1}", fg="#888888", bg="black")
             self.event_done_cams.add(index)
 
@@ -4224,7 +3601,7 @@ class tapoStreamer:
 
         # Player control buttons
         try:
-            exit_img = self.icon_cache["exit"]  # Use cached icon
+            exit_img = self.icon_cache["exit"]
             self.exit_buttons[index] = tk.Button(
                 self.labels[index],
                 image=exit_img,
@@ -4235,7 +3612,7 @@ class tapoStreamer:
             )
             self.exit_buttons[index].image = exit_img
 
-            pause_img = self.icon_cache["pause"]  # Use cached icon
+            pause_img = self.icon_cache["pause"]
             self.pause_buttons[index] = tk.Button(
                 self.labels[index],
                 image=pause_img,
@@ -4246,7 +3623,7 @@ class tapoStreamer:
             )
             self.pause_buttons[index].image = pause_img
 
-            speed_img = self.icon_cache["speed"]  # Use cached icon
+            speed_img = self.icon_cache["speed"]
             self.speed_buttons[index] = tk.Button(
                 self.labels[index],
                 image=speed_img,
@@ -4257,7 +3634,7 @@ class tapoStreamer:
             )
             self.speed_buttons[index].image = speed_img
 
-            replay_img = self.icon_cache["replay"]  # Use cached icon
+            replay_img = self.icon_cache["replay"]
             self.replay_buttons[index] = tk.Button(
                 self.labels[index],
                 image=replay_img,
@@ -4268,7 +3645,7 @@ class tapoStreamer:
             )
             self.replay_buttons[index].image = replay_img
 
-            rewind_img = self.icon_cache["rewind"]  # Use cached icon
+            rewind_img = self.icon_cache["rewind"]
             self.rewind_buttons[index] = tk.Button(
                 self.labels[index],
                 image=rewind_img,
@@ -4405,7 +3782,7 @@ class tapoStreamer:
         self.is_paused[index] = not self.is_paused[index]
         self.playback_speeds[index] = 1.0
 
-        new_icon = self.icon_cache["play" if self.is_paused[index] else "pause"]  # Use cached icon
+        new_icon = self.icon_cache["play" if self.is_paused[index] else "pause"]
         self.pause_buttons[index].configure(image=new_icon)
         self.pause_buttons[index].image = new_icon
 
@@ -4419,11 +3796,7 @@ class tapoStreamer:
                 logging.error(f"Error toggling pause for stream {index}: {e}")
 
     def toggle_archive_audio(self, index):
-        """Toggle mute for an archive/event clip.
-
-        If exclusive_archive_audio is enabled, unmuting one stream mutes
-        all others first so only one clip ever plays audio at a time.
-        """
+        # Toggle mute for an archive/event clip.
         currently_muted = self.archive_audio_muted[index]
         new_muted = not currently_muted
 
@@ -4536,10 +3909,7 @@ class tapoStreamer:
                         if self.event_mode:
                             self.root.after(0, self._on_event_clip_ended, index)
                             break
-                        # Video finished naturally - store position == duration
-                        # rather than deleting the entry, so the thumbnail
-                        # shows a full red progress bar for a fully-watched
-                        # clip instead of losing its progress bar entirely.
+             
                         existing = self.watch_progress[index].get(video_path, {})
                         duration = existing.get("duration", 0)
                         if duration > 0:
@@ -4549,18 +3919,7 @@ class tapoStreamer:
                             }
                             self.watch_progress_dirty = True
                         break
-                    # Record live position/duration (both in seconds) so the
-                    # archive grid can render a YouTube-style progress bar and
-                    # so playback can resume here next time, if enabled.
-                    #
-                    # At higher playback speeds (2x+) libvlc can momentarily
-                    # report get_length() as 0/None or get_time() as -1 while
-                    # it's working to keep up - these are transient, not the
-                    # real duration changing. Only commit a reading when both
-                    # values look sane, so a single bad tick can't be
-                    # interpreted as "reset to zero progress" by anything
-                    # reading watch_progress between this tick and the next
-                    # good one.
+             
                     position_ms = self.media_players[index].get_time()
                     duration_ms = self.media_players[index].get_length()
                     if position_ms is not None and position_ms > 0 and duration_ms and duration_ms > 0:
@@ -4754,11 +4113,6 @@ class tapoStreamer:
 
 
     def apply_window_size(self, size):
-        """
-        Apply the saved window size or fullscreen state and center the window.
-        Args:
-            size (str): Window size in the format 'WIDTHxHEIGHT' or 'fullscreen'.
-        """
         logging.info(f"Applying window size: {size}")
         try:
             if size.lower() == "fullscreen":
@@ -4795,12 +4149,6 @@ class tapoStreamer:
             logging.debug(f"Fallback to default size {width}x{height} and centered")
 
     def center_window(self, width, height):
-        """
-        Center the window on the screen, accounting for taskbar height on Windows.
-        Args:
-            width (int): Window width in pixels.
-            height (int): Window height in pixels.
-        """
         try:
             screen_width = self.root.winfo_screenwidth()
             screen_height = self.root.winfo_screenheight()
@@ -4834,40 +4182,21 @@ class tapoStreamer:
             logging.debug(f"Fallback to position {width}x{height}+0+0")
 
     def clamp_size(self, width, height):
-        """
-        Ensure window size is within valid bounds.
-        Args:
-            width (int): Desired width.
-            height (int): Desired height.
-        Returns:
-            tuple: Clamped (width, height).
-        """
         screen_width = self.root.winfo_screenwidth() - 50  # Margin for panels/docks
         screen_height = self.root.winfo_screenheight() - 100
         return (max(self.MIN_WIDTH, min(width, screen_width)),
                 max(self.MIN_HEIGHT, min(height, screen_height)))
 
     def force_unmaximize(self, width, height):
-        """
-        Ensure the window is not maximized before setting geometry.
-        Args:
-            width (int): Target width.
-            height (int): Target height.
-        Returns:
-            bool: True if unmaximized successfully, False otherwise.
-        """
         try:
             self.root.wm_state("normal")
             self.root.update_idletasks()
             for attempt in range(3):
                 if self.root.wm_state() != "zoomed":
-                    logging.debug(f"Unmaximized after {attempt+1} attempt(s)")
                     return True
-                logging.debug(f"Still maximized (attempt {attempt+1}/3)")
                 self.root.wm_state("normal")
                 self.root.update_idletasks()
                 time.sleep(0.1)
-            logging.warning("Failed to unmaximize after 3 attempts, applying geometry anyway")
             return False
         except Exception as e:
             logging.error(f"Error forcing unmaximize: {e}", exc_info=True)
@@ -4901,14 +4230,8 @@ class tapoStreamer:
         return 0
 
     def cleanup_archive_mode(self, index):
-        """Clean up archive mode state and UI for the specified stream index."""
+        # Clean up archive mode state and UI for the specified stream index.
         try:
-            # Stop and release any VLC player playing a clip BEFORE
-            # destroying the Tk widget it's embedded in (vlc_frame, a
-            # child of self.labels[index]). Destroying the widget first
-            # leaves libvlc's vout thread holding an XID for a window
-            # that no longer exists, causing a BadWindow X error on its
-            # next draw.
             if self.media_players[index]:
                 self.cleanup_stream(index)
 
@@ -4963,19 +4286,16 @@ class tapoStreamer:
                 self.archive_mode_button.destroy()
                 self.archive_mode_button = None
                 self.archive_mode_image = None
-                logging.debug("Destroyed archive mode button")
             # Destroy archive buttons
             for i in range(4):
                 if self.archive_buttons[i]:
                     self.archive_buttons[i].destroy()
                     self.archive_buttons[i] = None
-                    logging.debug(f"Destroyed archive button {i}")
             # Destroy fullscreen buttons
             for i in range(4):
                 if self.fullscreen_buttons[i]:
                     self.fullscreen_buttons[i].destroy()
                     self.fullscreen_buttons[i] = None
-                    logging.debug(f"Destroyed fullscreen button {i}")
             logging.debug("Config panel cleaned up successfully")
         except Exception as e:
             logging.debug(f"Error cleaning up config panel: {e}")
@@ -4984,10 +4304,7 @@ class tapoStreamer:
     def cleanup(self):
         self.enable_ptz_buttons()
 
-        # Signal all background threads to stop before touching any VLC
-        # object. Threads check self.running and stream_cleanup_events;
-        # setting both here gives them the earliest possible notice so
-        # they are less likely to be mid-libvlc-call when we release.
+        # Signal all background threads to stop before touching any VLC object.
         self.running = False
         for i in range(4):
             self.stream_cleanup_events[i].set()
@@ -5012,25 +4329,13 @@ class tapoStreamer:
                 pass
         self._pending_event_afters = []
 
-        # ── VLC teardown on a background thread ──────────────────────────
-        # player.stop() / instance.release() can block for several seconds
-        # on Windows while libvlc drains its decode thread. Running this
-        # off the main thread keeps the Tk event loop alive so Windows
-        # does not mark the window as "not responding".
-        #
-        # Withdraw the window immediately so the user sees it gone, then
-        # let the background thread finish and schedule root.destroy().
+        # VLC teardown on a background thread
         try:
             self.root.withdraw()
         except Exception:
             pass
 
         def _vlc_teardown():
-            # Stop and release every stream. cleanup_stream() handles
-            # the stream_cleanup_events signal, player.stop(),
-            # player.release(), and instance.release() in one place.
-            # Do NOT also release vlc_instances[] separately above or
-            # we get a double-free (the previous bug).
             for i in range(4):
                 try:
                     self.cleanup_stream(i)
