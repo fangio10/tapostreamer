@@ -79,10 +79,87 @@ class tapoStreamer:
             logging.error(f"Failed to parse VLC parameters '{raw}': {e}", exc_info=True)
             return default
 
+    VK_LBUTTON = 0x01
+    VK_RBUTTON = 0x02
+
     MIN_WIDTH = 1340
     MIN_HEIGHT = 720
     FONT_CANDIDATES = ["Verdana", "Tahoma", "Arial", "Segoe UI", "DejaVu Sans", "Liberation Sans", "Noto Sans"]
     FONT_FALLBACK = "Helvetica"  # Always resolvable as a Tk built-in alias, even if nothing above matches
+
+    # Maps raw filename detection-type tokens (case-insensitive) to a
+    # canonical id. Several raw tokens can collapse onto the same canonical
+    # id - this includes legacy tokens used before the downloader switched
+    # to alarm_type-code-based naming, so older files keep working.
+    DETECTION_TYPE_ALIASES = {
+        "motion": "motion",
+        "person": "person",
+        "person_detection": "person",
+        "pet": "pet",
+        "pet_detection": "pet",
+        "vehicle": "vehicle",
+        "vehicle_detection": "vehicle",
+        "baby_cry": "baby_cry",
+        "baby_crying": "baby_cry",
+        "bark": "bark",
+        "meow": "meow",
+        "line_crossing": "line_crossing",
+        "area_intrusion": "area_intrusion",
+        "tamper": "tamper",
+        "tampering": "tamper",
+        "glass_break": "glass_break",
+        "smoke": "smoke",
+        "face": "face",
+        "loitering": "loitering",
+        "package_delivered": "package_delivered",
+        "package_picked_up": "package_picked_up",
+    }
+
+    # Canonical id -> friendly display label, in a sensible default order.
+    DETECTION_TYPE_LABELS = {
+        "motion": "Motion",
+        "person": "Person",
+        "pet": "Pet",
+        "vehicle": "Vehicle",
+        "face": "Face",
+        "line_crossing": "Line Crossing",
+        "area_intrusion": "Area Intrusion",
+        "loitering": "Loitering",
+        "package_delivered": "Package Delivered",
+        "package_picked_up": "Package Picked Up",
+        "tamper": "Tamper",
+        "baby_cry": "Baby Crying",
+        "bark": "Bark",
+        "meow": "Meow",
+        "glass_break": "Glass Break",
+        "smoke": "Smoke",
+    }
+
+    ALL_TYPES_LABEL = "All Types"
+
+    @classmethod
+    def normalize_detection_type(cls, raw):
+        """Map a raw filename token to a canonical detection-type id, or
+        None if it isn't a recognized detection type (keeps things forward
+        compatible with unrecognized future tags by falling back to
+        treating them as their own canonical id rather than dropping them)."""
+        if not raw:
+            return None
+        key = raw.strip().lower()
+        if key in cls.DETECTION_TYPE_ALIASES:
+            return cls.DETECTION_TYPE_ALIASES[key]
+        if key:
+            # Unknown tag - keep it visible/filterable rather than silently
+            # discarding it, using the raw token itself as the canonical id.
+            return key
+        return None
+
+    @classmethod
+    def detection_type_label(cls, canonical_id):
+        if canonical_id in cls.DETECTION_TYPE_LABELS:
+            return cls.DETECTION_TYPE_LABELS[canonical_id]
+        # Unknown canonical id - prettify it for display (e.g. "foo_bar" -> "Foo Bar")
+        return canonical_id.replace("_", " ").title()
 
     def check_decoder_availability(self):
         # Best-effort check for a hardware-capable ffmpeg h264 decoder.
@@ -109,11 +186,11 @@ class tapoStreamer:
                     "hardware-capable build (h264 with vaapi/cuda/qsv support)."
                 )
             else:
-                logging.debug("ffmpeg h264 decoder appears hardware-capable")
+                pass
         except FileNotFoundError:
-            logging.debug("ffmpeg not found on PATH, skipping decoder check")
-        except Exception as e:
-            logging.debug(f"Could not check ffmpeg decoder availability: {e}")
+            pass
+        except Exception:
+            pass
 
     def _setup_logging(self, debug_mode):
         logging.getLogger().handlers = []
@@ -189,10 +266,10 @@ class tapoStreamer:
             self.root.iconphoto(True, icon)
         except Exception as e:
             logging.error(f"Error loading icon: {e}", exc_info=True)
-            logging.debug(f"Error loading icon: {e}")
 
         # --- Initialize Core State ---
         self.root.configure(bg="#222222")
+        self.apply_theme()
         self.root.minsize(1340, 720)
         self.root.protocol("WM_DELETE_WINDOW", self.cleanup)
         self.running = True
@@ -244,6 +321,13 @@ class tapoStreamer:
         self.audio_buttons = [None] * 4
         self.archive_audio_muted = [True] * 4
         self.event_mode = False
+
+        # Hover/click polling state for clip-playback controls (used because
+        # the embedded VLC HWND swallows Tk mouse events on Windows).
+        self._hover_poll_ids = [None] * 4
+        self._prev_left_down = [False] * 4
+        self._prev_right_down = [False] * 4
+        self._clip_controls_visible = [False] * 4
 
         self.event_clip_queues = [[] for _ in range(4)]
         self.event_active_cams = set()
@@ -307,6 +391,148 @@ class tapoStreamer:
         self.update_streams()
         self.root.after(0, lambda: threading.Thread(target=self.start_streams, daemon=True).start())
 
+    THEME_PALETTES = {
+        "dark": {
+            "bg": "#222222", "bg_alt": "#2a2a2a", "fg": "#ffffff",
+            "fg_dim": "#aaaaaa", "accent": "#e62117",
+            "field_bg": "#333333", "border": "#444444",
+        },
+        "light": {
+            "bg": "#f0f0f0", "bg_alt": "#e2e2e2", "fg": "#1a1a1a",
+            "fg_dim": "#666666", "accent": "#c8261a",
+            "field_bg": "#ffffff", "border": "#bbbbbb",
+        },
+    }
+
+    def detect_system_theme(self):
+        """Best-effort detection of the OS-wide light/dark preference.
+        Falls back to 'dark' if it can't be determined."""
+        try:
+            if sys.platform.startswith("win"):
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+                )
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return "light" if value else "dark"
+            elif sys.platform.startswith("linux"):
+                import subprocess
+                try:
+                    result = subprocess.run(
+                        ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0 and "light" in result.stdout.lower():
+                        return "light"
+                    if result.returncode == 0 and "dark" in result.stdout.lower():
+                        return "dark"
+                except Exception:
+                    pass
+                try:
+                    result = subprocess.run(
+                        ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0 and "dark" in result.stdout.lower():
+                        return "dark"
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.debug(f"Could not detect system theme, defaulting to dark: {e}")
+        return "dark"
+
+    def apply_theme(self):
+        """Apply the active theme (dark/light/system) to ttk and plain Tk
+        widgets, so the app looks the same on Windows 11 as it does on
+        Linux instead of relying on the native/system ttk theme.
+
+        Note: this only re-themes UI chrome (dialogs, config panel,
+        archive browser, buttons/text). Camera and clip video panels are
+        intentionally left black regardless of theme, since that's the
+        right backdrop for video either way."""
+        mode = self.ui_theme
+        if mode == "system":
+            mode = self.detect_system_theme()
+        palette = self.THEME_PALETTES.get(mode, self.THEME_PALETTES["dark"])
+        self.active_theme_colors = palette
+
+        try:
+            bg = palette["bg"]
+            bg_alt = palette["bg_alt"]
+            fg = palette["fg"]
+            fg_dim = palette["fg_dim"]
+            accent = palette["accent"]
+            field_bg = palette["field_bg"]
+            border = palette["border"]
+
+            style = ttk.Style(self.root)
+            style.theme_use("clam")
+
+            style.configure(".", background=bg, foreground=fg,
+                             fieldbackground=field_bg, bordercolor=border,
+                             darkcolor=bg, lightcolor=bg_alt,
+                             troughcolor=bg_alt, focuscolor=accent)
+
+            style.configure("TFrame", background=bg)
+            style.configure("TLabel", background=bg, foreground=fg)
+            style.configure("TSeparator", background=border)
+
+            style.configure("TButton", background=bg_alt, foreground=fg,
+                             bordercolor=border, focusthickness=1)
+            style.map("TButton",
+                      background=[("active", border), ("disabled", bg)],
+                      foreground=[("disabled", fg_dim)])
+
+            style.configure("TCheckbutton", background=bg, foreground=fg)
+            style.map("TCheckbutton",
+                      background=[("active", bg)],
+                      foreground=[("disabled", fg_dim)])
+
+            style.configure("TEntry", fieldbackground=field_bg, foreground=fg,
+                             insertcolor=fg, bordercolor=border)
+
+            style.configure("TCombobox", fieldbackground=field_bg, background=bg_alt,
+                             foreground=fg, arrowcolor=fg, bordercolor=border)
+            style.map("TCombobox",
+                      fieldbackground=[("readonly", field_bg)],
+                      foreground=[("disabled", fg_dim)])
+            self.root.option_add("*TCombobox*Listbox.background", field_bg)
+            self.root.option_add("*TCombobox*Listbox.foreground", fg)
+            self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
+
+            style.configure("TNotebook", background=bg, bordercolor=border)
+            style.configure("TNotebook.Tab", background=bg_alt, foreground=fg_dim,
+                             padding=(12, 6))
+            style.map("TNotebook.Tab",
+                      background=[("selected", bg)],
+                      foreground=[("selected", fg)])
+
+            style.configure("Vertical.TScrollbar", background=bg_alt,
+                             troughcolor=bg, arrowcolor=fg, bordercolor=border)
+            style.configure("Horizontal.TScrollbar", background=bg_alt,
+                             troughcolor=bg, arrowcolor=fg, bordercolor=border)
+
+            # Toplevel dialogs (e.g. the config window) don't pick up the
+            # root's bg automatically - apply the theme default for any
+            # new Toplevel/Frame/Label/Entry/Text created without one.
+            for widget_class in ("Toplevel", "Frame", "Label", "Text"):
+                self.root.option_add(f"*{widget_class}.background", bg)
+                self.root.option_add(f"*{widget_class}.foreground", fg)
+            self.root.option_add("*Entry.background", field_bg)
+            self.root.option_add("*Entry.foreground", fg)
+            self.root.option_add("*Entry.insertBackground", fg)
+            self.root.option_add("*Text.background", field_bg)
+            self.root.option_add("*Text.foreground", fg)
+            self.root.option_add("*Text.insertBackground", fg)
+            self.root.option_add("*Button.background", bg_alt)
+            self.root.option_add("*Button.foreground", fg)
+            self.root.option_add("*Button.activeBackground", border)
+
+            self.root.configure(bg=bg)
+        except Exception as e:
+            logging.warning(f"Failed to apply theme: {e}")
+
     def _init_font_choices(self):
         # Build the list of fonts offered in Options > General > Font.
         try:
@@ -367,6 +593,9 @@ class tapoStreamer:
         self.motion_triggered_events = False
         self.event_overlap_window_mins = 1
         self.exclusive_archive_audio = True
+        self.controls_position = "top-left"
+        self.default_event_filter = "all"
+        self.ui_theme = "dark"
 
         # Load from config file if it exists
         if os.path.exists(self.config_file):
@@ -410,6 +639,13 @@ class tapoStreamer:
                 if self.event_overlap_window_mins not in (1, 2, 3, 5):
                     self.event_overlap_window_mins = 1
                 self.exclusive_archive_audio = bool(config.get("exclusive_archive_audio", self.exclusive_archive_audio))
+                raw_cp = config.get("controls_position", self.controls_position)
+                self.controls_position = raw_cp if raw_cp in self.CONTROL_POSITIONS else "top-left"
+                self.default_event_filter = str(config.get("default_event_filter", self.default_event_filter) or "all").lower()
+                self.ui_theme = str(config.get("ui_theme", self.ui_theme) or "dark").lower()
+                if self.ui_theme not in ("dark", "light", "system"):
+                    logging.warning(f"Invalid ui_theme: {self.ui_theme}, using default 'dark'")
+                    self.ui_theme = "dark"
 
                 # Validate settings
                 try:
@@ -495,6 +731,9 @@ class tapoStreamer:
             "motion_triggered_events": self.motion_triggered_events,
             "event_overlap_window_mins": self.event_overlap_window_mins,
             "exclusive_archive_audio": self.exclusive_archive_audio,
+            "controls_position": self.controls_position,
+            "default_event_filter": self.default_event_filter,
+            "ui_theme": self.ui_theme,
         }
         try:
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
@@ -527,7 +766,6 @@ class tapoStreamer:
                         except (TypeError, ValueError, AttributeError):
                             continue
                     self.watch_progress[index] = cleaned
-            logging.debug("Loaded watch progress from disk")
         except Exception as e:
             logging.warning(f"Failed to load watch progress from {self.watch_progress_file}: {e}")
 
@@ -539,7 +777,6 @@ class tapoStreamer:
             with open(self.watch_progress_file, "w") as f:
                 json.dump(data, f, indent=2)
             self.watch_progress_dirty = False
-            logging.debug("Saved watch progress to disk")
         except Exception as e:
             logging.warning(f"Failed to save watch progress to {self.watch_progress_file}: {e}")
 
@@ -554,7 +791,12 @@ class tapoStreamer:
         notebook = ttk.Notebook(dialog)
         notebook.pack(pady=10, padx=10, fill="both", expand=True)
 
-        # Core Tab
+        # Connection Tab
+        connection_frame = ttk.Frame(notebook)
+        notebook.add(connection_frame, text="Connection")
+        connection_frame.columnconfigure(1, weight=1)
+
+        # General Tab
         core_frame = ttk.Frame(notebook)
         notebook.add(core_frame, text="General")
         core_frame.columnconfigure(1, weight=1)
@@ -580,33 +822,33 @@ class tapoStreamer:
             )
             return row + 1
 
-        # --- General Tab ---
-        row = 0
+        # --- Connection Tab ---
+        conn_row = 0
 
-        row = add_section_header(core_frame, "Connection", row)
+        conn_row = add_section_header(connection_frame, "Connection", conn_row)
 
         # Username
-        tk.Label(core_frame, text="Username:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        username_entry = tk.Entry(core_frame, width=32)
+        tk.Label(connection_frame, text="Username:", font=self.app_font(10)).grid(row=conn_row, column=0, **LBL)
+        username_entry = tk.Entry(connection_frame, width=32)
         username_entry.insert(0, self.username)
-        username_entry.grid(row=row, column=1, **WIDE)
-        row += 1
+        username_entry.grid(row=conn_row, column=1, **WIDE)
+        conn_row += 1
 
         # Password
-        tk.Label(core_frame, text="Password:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        password_entry = tk.Entry(core_frame, width=32)
+        tk.Label(connection_frame, text="Password:", font=self.app_font(10)).grid(row=conn_row, column=0, **LBL)
+        password_entry = tk.Entry(connection_frame, width=32)
         password_entry.insert(0, self.password)
-        password_entry.grid(row=row, column=1, **WIDE)
-        row += 1
+        password_entry.grid(row=conn_row, column=1, **WIDE)
+        conn_row += 1
 
         # Video Path
-        tk.Label(core_frame, text="Video Path:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
-        archive_entry = tk.Entry(core_frame, width=32)
+        tk.Label(connection_frame, text="Video Path:", font=self.app_font(10)).grid(row=conn_row, column=0, **LBL)
+        archive_entry = tk.Entry(connection_frame, width=32)
         archive_entry.insert(0, self.archive_dir)
-        archive_entry.grid(row=row, column=1, **WIDE)
-        row += 1
+        archive_entry.grid(row=conn_row, column=1, **WIDE)
+        conn_row += 1
 
-        row = add_section_header(core_frame, "Cameras", row)
+        conn_row = add_section_header(connection_frame, "Cameras", conn_row)
 
         # Camera IPs and settings
         ip_entries = []
@@ -614,10 +856,10 @@ class tapoStreamer:
         audio_checkboxes = []
         ptz_checkboxes = []
         for i in range(4):
-            tk.Label(core_frame, text=f"Cam {i+1} IP:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+            tk.Label(connection_frame, text=f"Cam {i+1} IP:", font=self.app_font(10)).grid(row=conn_row, column=0, **LBL)
 
-            cam_frame = ttk.Frame(core_frame)
-            cam_frame.grid(row=row, column=1, sticky="we", padx=(0, 12), pady=4)
+            cam_frame = ttk.Frame(connection_frame)
+            cam_frame.grid(row=conn_row, column=1, sticky="we", padx=(0, 12), pady=4)
 
             ip_entry = tk.Entry(cam_frame, width=16)
             ip_entry.insert(0, self.ips[i])
@@ -636,7 +878,22 @@ class tapoStreamer:
             ttk.Checkbutton(cam_frame, text="PTZ", variable=ptz_var).pack(side="left", padx=(8, 0))
             ptz_checkboxes.append(ptz_var)
 
-            row += 1
+            conn_row += 1
+
+        # --- General Tab ---
+        row = 0
+
+        row = add_section_header(core_frame, "Appearance", row)
+
+        THEME_LABELS = {"dark": "Dark", "light": "Light", "system": "Match System"}
+        THEME_VALUES_BY_LABEL = {v: k for k, v in THEME_LABELS.items()}
+        tk.Label(core_frame, text="Theme:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        theme_var = tk.StringVar(value=THEME_LABELS.get(self.ui_theme, "Dark"))
+        ttk.Combobox(
+            core_frame, textvariable=theme_var, values=list(THEME_LABELS.values()),
+            state="readonly", width=16
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
 
         row = add_section_header(core_frame, "Playback & Display", row)
 
@@ -658,6 +915,14 @@ class tapoStreamer:
         font_var = tk.StringVar(value=self.ui_font)
         ttk.Combobox(
             core_frame, textvariable=font_var, values=self.font_choice_labels, state="readonly", width=16
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        tk.Label(core_frame, text="Player Controls:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        controls_position_var = tk.StringVar(value=self.controls_position)
+        ttk.Combobox(
+            core_frame, textvariable=controls_position_var,
+            values=self.CONTROL_POSITIONS, state="readonly", width=16
         ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
@@ -703,6 +968,64 @@ class tapoStreamer:
             overlap_combo.config(state="readonly" if motion_events_var.get() else "disabled")
         motion_events_var.trace_add("write", _update_overlap_state)
         _update_overlap_state()
+
+        tk.Label(core_frame, text="Default Event Filter:", font=self.app_font(10)).grid(row=row, column=0, **LBL)
+        default_filter_labels = [self.ALL_TYPES_LABEL] + [
+            self.detection_type_label(cid) for cid in self.DETECTION_TYPE_LABELS
+        ]
+        current_default_label = (
+            self.ALL_TYPES_LABEL if self.default_event_filter == "all"
+            else self.detection_type_label(self.default_event_filter)
+        )
+        if current_default_label not in default_filter_labels:
+            default_filter_labels.append(current_default_label)
+        default_filter_var = tk.StringVar(value=current_default_label)
+        ttk.Combobox(
+            core_frame, textvariable=default_filter_var, values=default_filter_labels,
+            state="readonly", width=16
+        ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        row += 1
+
+        row = add_section_header(core_frame, "Events Cache", row)
+
+        def _clear_events_cache():
+            events_dir = self._events_dir()
+            removed = 0
+            errors = 0
+            if os.path.isdir(events_dir):
+                for root_dir, dirs, files in os.walk(events_dir):
+                    for fname in files:
+                        if fname.endswith(".json"):
+                            try:
+                                os.remove(os.path.join(root_dir, fname))
+                                removed += 1
+                            except Exception as e:
+                                logging.warning(f"Could not remove events cache file: {e}")
+                                errors += 1
+            if errors:
+                messagebox.showwarning(
+                    "Events Cache",
+                    f"Removed {removed} file(s), {errors} could not be deleted.",
+                    parent=dialog
+                )
+            else:
+                messagebox.showinfo(
+                    "Events Cache",
+                    f"Cleared {removed} cached event file(s)." if removed else "No cached event files found.",
+                    parent=dialog
+                )
+
+        cache_row = tk.Frame(core_frame)
+        cache_row.grid(row=row, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=4)
+        tk.Button(
+            cache_row, text="Clear Events Cache", font=self.app_font(10),
+            command=_clear_events_cache
+        ).pack(side="left")
+        tk.Label(
+            cache_row, text="Forces a fresh scan next time Events are opened",
+            font=self.app_font(9), fg="#888888"
+        ).pack(side="left", padx=(10, 0))
+        row += 1
 
         save_window_size_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(core_frame, text="Save Window Size", variable=save_window_size_var).grid(
@@ -777,50 +1100,9 @@ class tapoStreamer:
         no_frame_timeout_entry.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
-        row = add_section_header(advanced_frame, "Events Cache", row)
-
-        def _clear_events_cache():
-            events_dir = self._events_dir()
-            removed = 0
-            errors = 0
-            if os.path.isdir(events_dir):
-                for root_dir, dirs, files in os.walk(events_dir):
-                    for fname in files:
-                        if fname.endswith(".json"):
-                            try:
-                                os.remove(os.path.join(root_dir, fname))
-                                removed += 1
-                            except Exception as e:
-                                logging.warning(f"Could not remove events cache file: {e}")
-                                errors += 1
-            if errors:
-                messagebox.showwarning(
-                    "Events Cache",
-                    f"Removed {removed} file(s), {errors} could not be deleted.",
-                    parent=dialog
-                )
-            else:
-                messagebox.showinfo(
-                    "Events Cache",
-                    f"Cleared {removed} cached event file(s)." if removed else "No cached event files found.",
-                    parent=dialog
-                )
-
-        cache_row = tk.Frame(advanced_frame)
-        cache_row.grid(row=row, column=0, columnspan=2, sticky="w", padx=(12, 12), pady=4)
-        tk.Button(
-            cache_row, text="Clear Events Cache", font=self.app_font(10),
-            command=_clear_events_cache
-        ).pack(side="left")
-        tk.Label(
-            cache_row, text="Forces a fresh scan next time Events are opened",
-            font=self.app_font(9), fg="#888888"
-        ).pack(side="left", padx=(10, 0))
-        row += 1
-
         row = add_section_header(advanced_frame, "VLC Options", row)
 
-        vlc_params = tk.Text(advanced_frame, width=45, height=6)
+        vlc_params = tk.Text(advanced_frame, width=45, height=3)
         vlc_params.insert("1.0", ' '.join(self.vlcparams or self.DEFAULT_VLC_PARAMS))
         vlc_params.grid(row=row, column=0, columnspan=2, sticky="we", padx=(12, 12), pady=4)
         row += 1
@@ -850,7 +1132,8 @@ class tapoStreamer:
                 enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry,
                 downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry,
                 playback_speed_var, font_var, no_frame_timeout_entry, resume_playback_var,
-                motion_events_var, event_overlap_var, exclusive_audio_var
+                motion_events_var, event_overlap_var, exclusive_audio_var, default_filter_var,
+                theme_var, controls_position_var
             )
         ).pack(side="left", padx=5)
 
@@ -861,7 +1144,7 @@ class tapoStreamer:
 
         dialog.update_idletasks()
 
-    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, font_var=None, no_frame_timeout_entry=None, resume_playback_var=None, motion_events_var=None, event_overlap_var=None, exclusive_audio_var=None):
+    def save_streams(self, username_entry, password_entry, ip_entries, hq_checkboxes, audio_checkboxes, ptz_checkboxes, fullscreen_buttons_var, debug_var, archive_entry, vlc_params, ptz_resolution_var, save_window_size_var, dialog, enable_retries_var, max_retry_attempts_entry, initial_backoff_delay_entry, enable_quality_downgrade_var, drop_threshold_entry, drop_window_entry, downgrade_cooldown_entry, enable_auto_revert_hq_var, stability_period_entry, playback_speed_var, font_var=None, no_frame_timeout_entry=None, resume_playback_var=None, motion_events_var=None, event_overlap_var=None, exclusive_audio_var=None, default_filter_var=None, theme_var=None, controls_position_var=None):
         old_fullscreen_buttons = self.enable_fullscreen_buttons
         self.username = username_entry.get().strip()
         self.password = password_entry.get().strip()
@@ -875,6 +1158,9 @@ class tapoStreamer:
         if font_var is not None:
             chosen = font_var.get()
             self.ui_font = chosen if chosen in self.font_choice_labels else self.font_choice_labels[0]
+        if theme_var is not None:
+            theme_labels = {"Dark": "dark", "Light": "light", "Match System": "system"}
+            self.ui_theme = theme_labels.get(theme_var.get(), "dark")
         if resume_playback_var is not None:
             self.resume_playback = resume_playback_var.get()
         if motion_events_var is not None:
@@ -884,6 +1170,16 @@ class tapoStreamer:
             self.event_overlap_window_mins = v if v in (1, 2, 3, 5) else 1
         if exclusive_audio_var is not None:
             self.exclusive_archive_audio = exclusive_audio_var.get()
+        if controls_position_var is not None:
+            v = controls_position_var.get()
+            self.controls_position = v if v in self.CONTROL_POSITIONS else "top-left"
+        if default_filter_var is not None:
+            chosen_label = default_filter_var.get()
+            if chosen_label == self.ALL_TYPES_LABEL:
+                self.default_event_filter = "all"
+            else:
+                label_to_id = {self.detection_type_label(cid): cid for cid in self.DETECTION_TYPE_LABELS}
+                self.default_event_filter = label_to_id.get(chosen_label, "all")
     
         # Save default playback speed
         try:
@@ -991,6 +1287,7 @@ class tapoStreamer:
         self.drop_timestamps = [[] for _ in range(4)]
         self.update_streams()
         self.save_config()
+        self.apply_theme()
 
         # Update label bindings and rebuild config panel
         self.update_label_bindings()
@@ -1039,7 +1336,6 @@ class tapoStreamer:
             sock.close()
 
             if result == 0:
-                logging.debug(f"Network check: Camera at {host}:{port} is reachable")
                 return True
             else:
                 logging.warning(f"Network check: Camera at {host}:{port} is not reachable (error code: {result})")
@@ -1263,51 +1559,43 @@ class tapoStreamer:
             if self.labels[index].cget("text") == "Stream Failed, click to reconnect":
                 # Bind retry action for failed streams
                 self.labels[index].bind("<Button-1>", lambda event, idx=index: self.retry_stream_connection(idx))
-                logging.debug(f"Stream {index}: Bound label to retry connection (failed state)")
             else:
                 if self.event_mode:
-                    logging.debug(f"Stream {index}: No binding applied (event mode active)")
                     return
                 if not self.enable_fullscreen_buttons and self.streams[index]:
                     self.labels[index].bind("<Button-1>", lambda event, idx=index: self.handle_stream_click(idx))
-                    logging.debug(f"Stream {index}: Bound label to fullscreen action")
                 else:
-                    logging.debug(f"Stream {index}: No binding applied (fullscreen buttons enabled or stream inactive)")
+                    pass
         except Exception as e:
             logging.error(f"Stream {index}: Failed to bind stream label: {e}")
 
     def update_label_bindings(self):
         for i in range(4):
             self.bind_stream_label(i)
-        logging.debug("Updated label bindings for all streams")
+
+    def _apply_fullscreen_audio(self):
+        """Unmute the audio-enabled, non-archive stream currently shown in
+        fullscreen and mute all other audio-enabled, non-archive streams."""
+        for i in range(4):
+            if not self.streams[i] or not self.audio_enabled[i]:
+                continue
+            if self.is_archive_mode[i]:
+                continue
+            self.set_audio_state(i, mute=(i != self.fullscreen_index))
 
     def enter_fullscreen(self):
-        logging.debug("Entering fullscreen mode via up key")
         if self.is_fullscreen:
-            logging.debug("Already in fullscreen mode, no action taken")
             return
         for i in range(4):
             if self.streams[i]:
                 self.is_fullscreen = True
                 self.fullscreen_index = i
-                for j in range(4):
-                    if not self.streams[j] or not self.audio_enabled[j]:
-                        continue
-                    if self.is_archive_mode[j]:
-                        logging.debug(f"Stream {j}: Skipping audio management due to archive mode")
-                        continue
-                    if j == self.fullscreen_index:
-                        self.set_audio_state(j, mute=False)
-                    else:
-                        self.set_audio_state(j, mute=True)
+                self._apply_fullscreen_audio()
                 self.build_config_panel()
                 logging.info(f"Entered fullscreen mode for stream {i}")
                 break
-        else:
-            logging.debug("No enabled streams to enter fullscreen mode")
 
     def exit_fullscreen(self, event=None):
-        logging.debug(f"exit_fullscreen called (event={event}, is_fullscreen={self.is_fullscreen})")
 
         # Event mode intercept
         if self.event_mode:
@@ -1376,7 +1664,6 @@ class tapoStreamer:
                     self.set_audio_state(i, mute=True)
 
             self.build_config_panel()
-            logging.debug("Exiting fullscreen mode")
         else:
             any_archive_mode = False
             for i in range(4):
@@ -1386,7 +1673,6 @@ class tapoStreamer:
 
             if any_archive_mode:
                 self.build_config_panel()
-                logging.debug("Exiting archive mode")
 
     def build_config_panel(self):
         try:
@@ -1415,7 +1701,6 @@ class tapoStreamer:
                     activebackground="#222222", relief="flat",
                     command=self.exit_fullscreen, cursor="hand2"
                 )
-                self.exit_fullscreen_button.bind("<Button-1>", lambda e: logging.debug("Clicked exit_fullscreen button"))
 
             if not self.config_button:
                 self.config_img = self.icon_cache["config"]
@@ -1424,7 +1709,6 @@ class tapoStreamer:
                     activebackground="#222222", relief="flat",
                     command=self.show_config_dialog, cursor="hand2"
                 )
-                self.config_button.bind("<Button-1>", lambda e: logging.debug("Clicked config button"))
 
             if not self.archive_mode_button:
                 self.archive_mode_image = self.icon_cache["disk"]
@@ -1433,7 +1717,6 @@ class tapoStreamer:
                     activebackground="#222222", relief="flat",
                     command=self.toggle_all_archive_mode, cursor="hand2"
                 )
-                self.archive_mode_button.bind("<Button-1>", lambda e: logging.debug("Clicked archive mode button"))
 
             if not self.events_button:
                 self.events_button_image = self.icon_cache["events"]
@@ -1442,7 +1725,6 @@ class tapoStreamer:
                     activebackground="#222222", relief="flat",
                     command=self.toggle_event_mode, cursor="hand2"
                 )
-                self.events_button.bind("<Button-1>", lambda e: logging.debug("Clicked events button"))
 
             for i in range(4):
                 if not self.fullscreen_buttons[i]:
@@ -1452,7 +1734,6 @@ class tapoStreamer:
                         command=lambda idx=i: self.handle_stream_click(idx),
                         state="disabled" if not self.enable_fullscreen_buttons else "normal"
                     )
-                    self.fullscreen_buttons[i].bind("<Button-1>", lambda e, idx=i: logging.debug(f"Clicked fullscreen_{idx} button"))
 
             if self.is_fullscreen and self.fullscreen_index is not None:
                 if not self.archive_buttons[self.fullscreen_index]:
@@ -1460,9 +1741,6 @@ class tapoStreamer:
                     self.archive_buttons[self.fullscreen_index] = tk.Button(
                         self.config_panel, image=img, bg="#222222", bd=0, cursor="hand2",
                         command=lambda idx=self.fullscreen_index: self.toggle_archive_mode(idx)
-                    )
-                    self.archive_buttons[self.fullscreen_index].bind(
-                        "<Button-1>", lambda e, idx=self.fullscreen_index: logging.debug(f"Clicked archive_{idx} button")
                     )
 
             # Forget all buttons before re-packing
@@ -1489,32 +1767,24 @@ class tapoStreamer:
                 self.exit_fullscreen_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=5, padx=10)
             else:
+                any_initializing = any(self.stream_initializing)
                 # Pack archive mode button only in grid mode if archive_dir is valid.
                 if self.archive_dir:
-                    any_initializing = any(self.stream_initializing)
                     self.archive_mode_button.configure(
                         state="disabled" if any_initializing else "normal"
                     )
                     self.archive_mode_button.pack(pady=5, padx=10)
                 # Pack events button in grid mode if motion_triggered_events is on
                 if self.motion_triggered_events and self.archive_dir:
-                    any_initializing = any(self.stream_initializing)
                     self.events_button.configure(
                         state="disabled" if any_initializing else "normal"
                     )
                     self.events_button.pack(pady=5, padx=10)
                 self.config_button.pack(pady=10, padx=10)
-                # Place fullscreen buttons in grid mode
+                # Place fullscreen buttons in grid mode. Fullscreen buttons
+                # are never shown in event mode: single-cam events auto-enter
+                # fullscreen, multi-cam events don't support it.
                 for i in range(4):
-                    if (self.enable_fullscreen_buttons and self.ips[i] and not self.is_archive_mode[i]):
-                        self.fullscreen_buttons[i].configure(state="normal")
-                        self.fullscreen_buttons[i].place(relx=1.0, rely=1.0, x=-35, y=-35, anchor="se")
-                        self.fullscreen_buttons[i].lift()
-                    elif self.fullscreen_buttons[i]:
-                        self.fullscreen_buttons[i].place_forget()
-                for i in range(4):
-                    # Fullscreen buttons are never shown in event mode: single-cam
-                    # events auto-enter fullscreen, multi-cam events don't support it.
                     if (self.enable_fullscreen_buttons and self.ips[i] and not self.is_archive_mode[i]
                             and not self.event_mode):
                         self.fullscreen_buttons[i].configure(state="normal")
@@ -1523,13 +1793,11 @@ class tapoStreamer:
                     elif self.fullscreen_buttons[i]:
                         self.fullscreen_buttons[i].place_forget()
 
-            logging.debug("Config panel built successfully")
-        except Exception as e:
-            logging.debug(f"Error building config panel: {e}")
+        except Exception:
+            pass
 
     
     def iterate_streams(self, direction):
-        print(f"Iterating streams, direction={direction}")
         if not self.is_fullscreen:
             return
         if self.fullscreen_index is None:
@@ -1558,7 +1826,6 @@ class tapoStreamer:
 
         self.build_config_panel()
         self.debounce_layout_update()
-        print(f"Iterated to stream {new_index} (direction={direction})")
 
 
     def init_ui(self):
@@ -1598,8 +1865,6 @@ class tapoStreamer:
 
         self.root.bind("<Alt-Return>", handle_fullscreen_toggle)
         self.root.bind("<Shift_L>", handle_fullscreen_toggle)
-        self.root.bind("<KeyPress-q>", lambda e: self.cleanup())
-        self.root.bind("<KeyPress-Q>", lambda e: self.cleanup())
         self.root.bind("<Up>", lambda e: self.enter_fullscreen())
         self.root.bind("<Down>", lambda e: self.exit_fullscreen())
         self.root.bind("<Button-3>", lambda e: self.exit_fullscreen())
@@ -1618,33 +1883,28 @@ class tapoStreamer:
 
     def set_audio_state(self, index, mute=True):
         if not self.audio_enabled[index]:
-            logging.debug(f"Stream {index}: Audio disabled, skipping audio state change")
             return
 
         # Check if stream is initializing
         with self.stream_init_lock:
             if self.stream_initializing[index]:
-                logging.debug(f"Stream {index}: Skipped audio state change due to initializing state")
                 return
 
         if self.media_players[index]:
             try:
                 state = self.media_players[index].get_state()
                 if state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
-                    logging.debug(f"Stream {index}: Skipped audio state change due to invalid state: {state}")
                     return
                 self.media_players[index].audio_set_mute(mute)
-                logging.debug(f"Stream {index}: Set audio mute={mute}")
             except Exception as e:
                 logging.error(f"Stream {index}: Failed to set python-vlc audio state: {e}")
         else:
-            logging.debug(f"Stream {index}: No media player, skipping audio state change")
+            pass
 
     def update_stream_label(self, index, text, fg="white", image=""):
         """Update the stream label in a thread-safe manner."""
         try:
             self.root.after(0, lambda: self.labels[index].configure(image=image, text=text, fg=fg))
-            logging.debug(f"Stream {index}: Updated label to '{text}'")
         except Exception as e:
             logging.error(f"Stream {index}: Failed to update label: {e}")
 
@@ -1655,7 +1915,6 @@ class tapoStreamer:
                 logging.warning(f"Stream {index}: Already initializing, skipping retry")
                 return False
             self.stream_initializing[index] = True
-            logging.debug(f"Stream {index}: Marked as initializing")
 
         try:
             if not self.ips[index] or not self.streams[index]:
@@ -1705,7 +1964,11 @@ class tapoStreamer:
                 if self.init_stream(index):
                     logging.info(f"Stream {index}: Initialized successfully")
                     self.set_audio_state(index, mute=True)
-                    self.root.after(0, lambda: self.bind_stream_label(index))
+                    self.root.after(0, lambda idx=index: self.bind_stream_label(idx))
+                    # Windows + fullscreen buttons disabled: poll for left/right
+                    # click over the embedded HWND (native Tk events are swallowed).
+                    if sys.platform.startswith('win') and not self.enable_fullscreen_buttons:
+                        self.root.after(0, lambda idx=index: self._start_live_click_poll(idx))
                     return True
 
                 if self.stream_cleanup_events[index].is_set():
@@ -1732,7 +1995,6 @@ class tapoStreamer:
         finally:
             with self.stream_init_lock:
                 self.stream_initializing[index] = False
-                logging.debug(f"Stream {index}: Cleared initializing state")
 
     def build_vlc_instance_args(self, extra_args=None):
         """Build the common libvlc instance argument list, with optional
@@ -1783,8 +2045,8 @@ class tapoStreamer:
             # Keep a reference so it isn't garbage-collected while in use
             self._vlc_log_cb = log_cb
             instance.log_set(log_cb, None)
-        except Exception as e:
-            logging.debug(f"Could not attach libvlc log callback: {e}")
+        except Exception:
+            pass
 
     def init_stream(self, index):
         """Initialize a stream using Python-VLC (libvlc auto-selects hardware decode if available)."""
@@ -1853,7 +2115,6 @@ class tapoStreamer:
                         frame_times.append((time.time(), new_frames))
                         frame_times = [(t, f) for t, f in frame_times if time.time() - t < self.drop_window]
                         recent_frames = sum(f for _, f in frame_times)
-                        logging.debug(f"Stream {index}: New frames: {new_frames}, Recent: {recent_frames}")
                         if recent_frames >= required_frames:
                             for _ in range(5):
                                 time.sleep(0.5)
@@ -1878,6 +2139,7 @@ class tapoStreamer:
         """Clean up stream resources."""
         logging.info(f"Stream {index}: Cleaning up")
         self.stream_cleanup_events[index].set()
+        self._stop_hover_poll(index)
 
         try:
             # Stop media player
@@ -1886,7 +2148,6 @@ class tapoStreamer:
                     if self.media_players[index].get_state() not in (vlc.State.Stopped, vlc.State.Ended, vlc.State.Error):
                         self.media_players[index].stop()
                     self.media_players[index].release()
-                    logging.debug(f"Stream {index}: Released media player")
                 except Exception as e:
                     logging.error(f"Stream {index}: Error releasing media player: {e}")
                 self.media_players[index] = None
@@ -1898,7 +2159,6 @@ class tapoStreamer:
             if self.vlc_instances[index]:
                 try:
                     self.vlc_instances[index].release()
-                    logging.debug(f"Stream {index}: Released VLC instance")
                 except Exception as e:
                     logging.error(f"Stream {index}: Error releasing VLC instance: {e}")
                 self.vlc_instances[index] = None
@@ -1914,7 +2174,6 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Cleanup failed: {e}")
         finally:
             self.stream_cleanup_events[index].clear()
-            logging.debug(f"Stream {index}: Cleared cleanup event")
 
     def _retry_stream_connection_thread(self, index):
         """Thread function to retry stream connection and restore bindings."""
@@ -1949,7 +2208,6 @@ class tapoStreamer:
             self.labels[index].unbind("<Button-1>")
             # Bind retry action
             self.labels[index].bind("<Button-1>", lambda event, idx=index: self.retry_stream_connection(idx))
-            logging.debug(f"Stream {index}: Bound label to retry stream connection")
         except Exception as e:
             logging.error(f"Stream {index}: Failed to bind retry connection: {e}")
 
@@ -2005,7 +2263,6 @@ class tapoStreamer:
 
                             if dropped_frames > 0:
                                 self.drop_timestamps[index].append(current_time)
-                                logging.debug(f"Stream {index}: {dropped_frames} dropped frames this tick")
 
                             if displayed_frames > 0:
                                 last_frame_time = current_time
@@ -2014,7 +2271,6 @@ class tapoStreamer:
                             # do NOT advance last_frame_time so the no-frame timeout
                             # still fires if the stream is genuinely stalled.
                             self.drop_timestamps[index].append(current_time)
-                            logging.debug(f"Stream {index}: Stats unavailable this tick")
                     except Exception as e:
                         logging.warning(f"Stream {index}: Error fetching VLC stats: {e}")
                         self.drop_timestamps[index].append(current_time)
@@ -2129,7 +2385,6 @@ class tapoStreamer:
 
         # Skip update if state hasn't changed
         if hasattr(self, 'last_layout_state') and self.last_layout_state == current_state:
-            logging.debug("Skipping update_layout: No state change")
             return
 
         # Check if window size changed
@@ -2191,9 +2446,7 @@ class tapoStreamer:
         self.target_dims[index] = (w, h)
 
     def handle_stream_click(self, index):
-        logging.debug(f"Handling stream click for index {index}")
         if not self.streams[index] and not self.is_archive_mode[index]:
-            logging.debug(f"Stream {index} not enabled and not in archive mode, ignoring click")
             return
 
         if self.is_fullscreen and self.fullscreen_index == index:
@@ -2201,17 +2454,7 @@ class tapoStreamer:
         else:
             self.is_fullscreen = True  # Set fullscreen state directly
             self.fullscreen_index = index
-            # Manage audio
-            for i in range(4):
-                if not self.streams[i] or not self.audio_enabled[i]:
-                    continue
-                if self.is_archive_mode[i]:
-                    logging.debug(f"Stream {i}: Skipping audio management due to archive mode")
-                    continue
-                if i == self.fullscreen_index and self.is_fullscreen:
-                    self.set_audio_state(i, mute=False)
-                else:
-                    self.set_audio_state(i, mute=True)
+            self._apply_fullscreen_audio()
 
             self.build_config_panel()
         
@@ -2221,7 +2464,6 @@ class tapoStreamer:
     def toggle_all_archive_mode(self):
         """Toggle archive mode for all active streams based on current state."""
         if not self.archive_dir:
-            logging.debug("Toggle all archive mode ignored: No archive directory configured")
             return
 
         # Check if any stream is in archive mode
@@ -2247,11 +2489,9 @@ class tapoStreamer:
 
     def toggle_archive_mode(self, index, rebuild_ui=True):
         if not self.archive_dir:
-            logging.debug(f"Stream {index}: Toggle archive mode ignored, no archive directory configured")
             return
 
         if self.archive_transitioning[index]:
-            logging.debug(f"Stream {index}: Archive transition already in progress, ignoring toggle")
             return
         self.archive_transitioning[index] = True
 
@@ -2751,7 +2991,6 @@ class tapoStreamer:
             # Pagination text
             pagination_x = last_column_x - 100 
             pagination_y = 30
-            logging.debug(f"Stream {index}: Rendering pagination text at x={pagination_x}, y={pagination_y}, text='Page {current_page + 1}/{total_pages}'")
             self.archive_canvas[index].create_text(
                 pagination_x,
                 25,
@@ -2762,7 +3001,7 @@ class tapoStreamer:
             )
         else:
             # No pagination needed, ensure pagination text is not rendered
-            logging.debug(f"Stream {index}: No pagination needed (total_pages={total_pages}), skipping pagination buttons and text")
+            pass
     
     def change_page(self, index, delta):
         """Update the current page for the current path and re-render the view."""
@@ -2809,6 +3048,7 @@ class tapoStreamer:
 
     def _reset_clip_buttons(self, index):
         """Null out per-stream clip-playback button refs and reset playback flags."""
+        self._stop_hover_poll(index)
         self.exit_buttons[index]   = None
         self.pause_buttons[index]  = None
         self.speed_buttons[index]  = None
@@ -2816,6 +3056,227 @@ class tapoStreamer:
         self.rewind_buttons[index] = None
         self.audio_buttons[index]  = None
         self.video_ended[index]    = False
+
+    def _is_button_down(self, vk):
+        """Poll OS-level mouse button state. Only meaningful on Windows -
+        Linux relies on native Tk click events, which work fine over the
+        embedded video surface there."""
+        if not sys.platform.startswith('win'):
+            return False
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+        except Exception:
+            return False
+
+    def _clip_control_widgets(self, index):
+        return [
+            self.exit_buttons[index],
+            self.rewind_buttons[index],
+            self.pause_buttons[index],
+            self.speed_buttons[index],
+            self.replay_buttons[index],
+            self.audio_buttons[index],
+        ]
+
+    CONTROL_POSITIONS = [
+        "top-left", "top-center", "top-right",
+        "center",
+        "bottom-left", "bottom-center", "bottom-right",
+    ]
+
+    def _clip_control_positions(self):
+        """Return a list of place() kwargs dicts for each of the 6 clip-control
+        buttons, computed from self.controls_position."""
+        btn_w, btn_h = 40, 40
+        n_buttons = 6
+        strip_w = n_buttons * btn_w   # 240 px
+        margin = 10
+        pos = getattr(self, 'controls_position', 'top-left')
+
+        result = []
+        for bi in range(n_buttons):
+            dx = bi * btn_w   # each button's offset within the strip
+
+            if pos == "top-left":
+                kw = dict(relx=0.0, rely=0.0,
+                          x=margin + dx, y=margin, anchor="nw")
+            elif pos == "top-center":
+                kw = dict(relx=0.5, rely=0.0,
+                          x=-strip_w // 2 + dx, y=margin, anchor="nw")
+            elif pos == "top-right":
+                kw = dict(relx=1.0, rely=0.0,
+                          x=-(margin + strip_w) + dx, y=margin, anchor="nw")
+            elif pos == "center":
+                kw = dict(relx=0.5, rely=0.5,
+                          x=-strip_w // 2 + dx, y=-btn_h // 2, anchor="nw")
+            elif pos == "bottom-left":
+                kw = dict(relx=0.0, rely=1.0,
+                          x=margin + dx, y=-(margin + btn_h), anchor="nw")
+            elif pos == "bottom-center":
+                kw = dict(relx=0.5, rely=1.0,
+                          x=-strip_w // 2 + dx, y=-(margin + btn_h), anchor="nw")
+            elif pos == "bottom-right":
+                kw = dict(relx=1.0, rely=1.0,
+                          x=-(margin + strip_w) + dx, y=-(margin + btn_h), anchor="nw")
+            else:   # fallback
+                kw = dict(relx=0.0, rely=0.0,
+                          x=margin + dx, y=margin, anchor="nw")
+            result.append(kw)
+        return result
+
+    def _set_clip_controls_visible(self, index, visible):
+        """Show/hide the clip-playback control buttons for a stream. Cheap
+        no-op if already in the requested state."""
+        if self._clip_controls_visible[index] == visible:
+            return
+        self._clip_controls_visible[index] = visible
+        widgets = self._clip_control_widgets(index)
+        if visible:
+            for widget, kw in zip(widgets, self._clip_control_positions()):
+                if widget:
+                    widget.place(**kw)
+        else:
+            for widget in widgets:
+                if widget:
+                    widget.place_forget()
+
+    def _stop_hover_poll(self, index):
+        """Cancel the hover/click poll loop for a stream, if running."""
+        poll_id = self._hover_poll_ids[index]
+        if poll_id:
+            try:
+                self.root.after_cancel(poll_id)
+            except Exception:
+                pass
+            self._hover_poll_ids[index] = None
+        self._clip_controls_visible[index] = False
+        self._prev_left_down[index] = False
+        self._prev_right_down[index] = False
+
+    def _win_app_is_foreground(self):
+        """Return True if the foreground window belongs to our process.
+        More reliable than Tk's focus_displayof() which returns None whenever
+        an embedded native HWND (e.g. VLC) holds Win32 keyboard focus.
+        Checks process ownership rather than exact HWND match so dialogs,
+        embedded VLC windows, and child windows all count as 'ours'."""
+        if not sys.platform.startswith('win'):
+            return True
+        try:
+            fg = ctypes.windll.user32.GetForegroundWindow()
+            if fg == 0:
+                return False
+            pid = ctypes.c_ulong(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            return pid.value == os.getpid()
+        except Exception:
+            return True
+
+    def _start_hover_poll(self, index):
+        """Poll pointer position to drive clip-control visibility, and on
+        Windows poll button state for right-click → go_back.  Left-click
+        has no action here; the pause button in the control strip handles
+        pausing.
+
+        On Linux, X11 delivers clicks normally so we just bind right-click
+        directly and use the poll only for hover-based visibility."""
+        self._stop_hover_poll(index)
+
+        # Linux: the root-level <Button-3> binding fires exit_fullscreen, which
+        # already calls go_back when in archive mode, so no extra bind is needed
+        # here.  We do clear any stale bindings from a previous clip session.
+
+        def poll():
+            if not self.running or not self.media_players[index]:
+                self._set_clip_controls_visible(index, False)
+                self._hover_poll_ids[index] = None
+                return
+
+            try:
+                px, py = self.root.winfo_pointerxy()
+                label = self.labels[index]
+                x0 = label.winfo_rootx()
+                y0 = label.winfo_rooty()
+                inside = (x0 <= px <= x0 + label.winfo_width() and
+                          y0 <= py <= y0 + label.winfo_height())
+            except Exception:
+                inside = False
+
+            self._set_clip_controls_visible(index, inside)
+
+            # Windows only: right-click → go_back (or exit_fullscreen in
+            # event mode, which has its own intercept to stop all clips and
+            # re-show the event overlay — matching the Linux root-binding
+            # behaviour that the HWND swallows during clip playback).
+            if (sys.platform.startswith('win') and inside
+                    and self._win_app_is_foreground()):
+                right_down = self._is_button_down(self.VK_RBUTTON)
+                if self._prev_right_down[index] and not right_down:
+                    self._prev_right_down[index] = False
+                    if self.event_mode:
+                        self.exit_fullscreen()
+                    else:
+                        self.go_back(index)
+                    return  # Don't reschedule — action taken, state may be torn down
+                self._prev_right_down[index] = right_down
+            elif not inside:
+                self._prev_right_down[index] = False
+
+            interval = 60 if sys.platform.startswith('win') else 150
+            self._hover_poll_ids[index] = self.root.after(interval, poll)
+
+        poll()
+
+    def _start_live_click_poll(self, index):
+        """Windows-only poll for live (non-archive) streams when fullscreen
+        buttons are disabled.  Replicates the left/right click behaviour that
+        native Tk bindings provide on Linux but that the embedded VLC HWND
+        swallows on Windows:
+            left-click  → handle_stream_click  (enter/exit fullscreen)
+            right-click → exit_fullscreen       (back to grid)
+
+        Shares _hover_poll_ids[index] with _start_hover_poll — the two are
+        mutually exclusive per stream (live vs clip-playback)."""
+        if not sys.platform.startswith('win'):
+            return  # Linux handles this via native Tk bindings
+        self._stop_hover_poll(index)
+
+        def poll():
+            # Stop if the stream has gone away or we've entered clip playback.
+            if not self.running or self.is_archive_mode[index]:
+                self._hover_poll_ids[index] = None
+                return
+
+            if self._win_app_is_foreground():
+                try:
+                    px, py = self.root.winfo_pointerxy()
+                    label = self.labels[index]
+                    x0 = label.winfo_rootx()
+                    y0 = label.winfo_rooty()
+                    inside = (x0 <= px <= x0 + label.winfo_width() and
+                              y0 <= py <= y0 + label.winfo_height())
+                except Exception:
+                    inside = False
+
+                if inside:
+                    left_down  = self._is_button_down(self.VK_LBUTTON)
+                    right_down = self._is_button_down(self.VK_RBUTTON)
+                    if self._prev_left_down[index] and not left_down:
+                        self._prev_left_down[index] = False
+                        self.handle_stream_click(index)
+                        return  # Don't reschedule — state may have changed
+                    if self._prev_right_down[index] and not right_down:
+                        self._prev_right_down[index] = False
+                        self.exit_fullscreen()
+                        return  # Don't reschedule — state may have changed
+                    self._prev_left_down[index] = left_down
+                    self._prev_right_down[index] = right_down
+                else:
+                    self._prev_left_down[index] = False
+                    self._prev_right_down[index] = False
+
+            self._hover_poll_ids[index] = self.root.after(60, poll)
+
+        poll()
 
     def go_back(self, index):
         # In event mode the exit button should follow the clip queue rather
@@ -2907,8 +3368,10 @@ class tapoStreamer:
         gap_limit = timedelta(minutes=self.event_overlap_window_mins)
 
         # --- Collect all parseable clips across all cams ---
-        clip_re = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}(?:-\d{2})?)_(\d+)m-(\d+)s\.mp4$")
-        all_clips = []  # (start_dt, end_dt, cam_index, abs_path)
+        # Trailing _<detectiontype> is optional, for backwards compatibility
+        # with clips recorded before detection-type tagging was added.
+        clip_re = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}(?:-\d{2})?)_(\d+)m-(\d+)s(?:_([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*))?\.mp4$")
+        all_clips = []  # (start_dt, end_dt, cam_index, abs_path, detection_type)
 
         for cam_idx in range(4):
             if not self.ips[cam_idx]:
@@ -2925,7 +3388,7 @@ class tapoStreamer:
                 m = clip_re.match(fname)
                 if not m:
                     continue
-                d_str, t_str, mins_str, secs_str = m.groups()
+                d_str, t_str, mins_str, secs_str, raw_type = m.groups()
                 try:
                     start_dt = datetime.strptime(f"{d_str} {t_str.replace('-', ':')}", "%Y-%m-%d %H:%M:%S" if t_str.count('-') == 2 else "%Y-%m-%d %H:%M")
                     duration_s = int(mins_str) * 60 + int(secs_str)
@@ -2933,9 +3396,9 @@ class tapoStreamer:
                     continue
                 if duration_s < min_duration_s:
                     continue
-                from datetime import timedelta as _td
-                end_dt = start_dt + _td(seconds=duration_s)
-                all_clips.append((start_dt, end_dt, cam_idx, os.path.join(day_folder, fname)))
+                end_dt = start_dt + timedelta(seconds=duration_s)
+                detection_type = self.normalize_detection_type(raw_type)
+                all_clips.append((start_dt, end_dt, cam_idx, os.path.join(day_folder, fname), detection_type))
 
         if not all_clips:
             return []
@@ -2955,32 +3418,37 @@ class tapoStreamer:
 
             e_start = cluster[0][0]
             e_end   = cluster[0][1]
-            for s_dt, e_dt, ci, path in cluster:
+            detection_types = set()
+            for s_dt, e_dt, ci, path, detection_type in cluster:
                 if s_dt < e_start:
                     e_start = s_dt
                 if e_dt > e_end:
                     e_end = e_dt
                 cams_data[str(ci + 1)]["clips"].append({
-                    "path":       path,
-                    "clip_start": s_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "clip_end":   e_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "path":           path,
+                    "clip_start":     s_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "clip_end":       e_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "detection_type": detection_type,
                 })
                 cams_data[str(ci + 1)]["enabled"] = True
+                if detection_type:
+                    detection_types.add(detection_type)
 
             # Sort clips within each cam by start time
             for cd in cams_data.values():
                 cd["clips"].sort(key=lambda c: c["clip_start"])
 
             return {
-                "id":      e_start.strftime("%Y%m%d_%H%M%S"),
-                "start":   e_start.strftime("%Y-%m-%dT%H:%M:%S"),
-                "end":     e_end.strftime("%Y-%m-%dT%H:%M:%S"),
-                "played":  False,
-                "cams":    cams_data,
+                "id":               e_start.strftime("%Y%m%d_%H%M%S"),
+                "start":            e_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                "end":              e_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                "played":           False,
+                "cams":             cams_data,
+                "detection_types":  sorted(detection_types),
             }
 
         for clip in all_clips:
-            s_dt, e_dt, ci, path = clip
+            s_dt, e_dt, ci, path, detection_type = clip
             if window_end is None or s_dt > window_end + gap_limit:
                 # New event cluster
                 if current_cluster:
@@ -3031,6 +3499,22 @@ class tapoStreamer:
                 json.dump(payload, f, indent=2)
         except Exception as e:
             logging.warning(f"Events: failed to write cache {json_path}: {e}")
+
+    def _event_detection_types(self, event):
+        """Return the sorted list of canonical detection-type ids present in
+        an event, deriving them from clips if the cached JSON predates the
+        detection_types field."""
+        if "detection_types" in event:
+            return event["detection_types"]
+        types = set()
+        for cam_data in event.get("cams", {}).values():
+            for clip in cam_data.get("clips", []):
+                dt = clip.get("detection_type")
+                if dt:
+                    types.add(dt)
+        result = sorted(types)
+        event["detection_types"] = result  # cache on the dict for this session
+        return result
 
     def toggle_event_mode(self):
         """Toggle between event-mode (overlay + coordinated playback) and live."""
@@ -3181,6 +3665,55 @@ class tapoStreamer:
                               font=self.app_font(11),
                               command=self._exit_event_mode)
         close_btn.pack(side="right", padx=10, pady=6)
+
+        ttk.Separator(overlay, orient="horizontal").pack(fill="x")
+
+        # ---- Filter bar ----
+        filter_bar = tk.Frame(overlay, bg="#1a1a1a")
+        filter_bar.pack(fill="x")
+
+        tk.Label(filter_bar, text="Filter:", bg="#1a1a1a", fg="#888888",
+                 font=self.app_font(9)).pack(side="left", padx=(12, 6), pady=4)
+
+        filter_var = tk.StringVar(value=self.ALL_TYPES_LABEL)
+        filter_combo = ttk.Combobox(
+            filter_bar, textvariable=filter_var, state="readonly", width=18
+        )
+        filter_combo.pack(side="left", pady=4)
+
+        def _label_for_type(canonical_id):
+            return self.detection_type_label(canonical_id)
+
+        def _refresh_filter_options(evs, preserve_selection=False):
+            """Rebuild the filter dropdown's options from the detection
+            types actually present in evs. By default applies the
+            configured default (falling back to All Types if not present);
+            when preserve_selection is True, keeps the current choice if
+            it's still a valid option (e.g. after deleting an event)."""
+            present_ids = sorted({t for ev in evs for t in self._event_detection_types(ev)})
+            options = [self.ALL_TYPES_LABEL] + [_label_for_type(cid) for cid in present_ids]
+            filter_combo.configure(values=options)
+
+            if preserve_selection and filter_var.get() in options:
+                return present_ids
+
+            if self.default_event_filter != "all" and self.default_event_filter in present_ids:
+                desired = _label_for_type(self.default_event_filter)
+            else:
+                desired = self.ALL_TYPES_LABEL
+            filter_var.set(desired)
+            return present_ids
+
+        def _filtered_events():
+            chosen = filter_var.get()
+            if chosen == self.ALL_TYPES_LABEL:
+                return state["events"]
+            label_to_id = {_label_for_type(cid): cid for cid in
+                           {t for ev in state["events"] for t in self._event_detection_types(ev)}}
+            chosen_id = label_to_id.get(chosen)
+            if not chosen_id:
+                return state["events"]
+            return [ev for ev in state["events"] if chosen_id in self._event_detection_types(ev)]
 
         ttk.Separator(overlay, orient="horizontal").pack(fill="x")
 
@@ -3350,7 +3883,8 @@ class tapoStreamer:
                     ):
                         state["events"].pop(idx)
                         self._save_events_json(state["date"], state["events"])
-                        _render_rows(state["events"])
+                        _refresh_filter_options(state["events"], preserve_selection=True)
+                        _render_rows(_filtered_events())
 
                 # Click and hover bindings for the Label-based icons.
                 HOVER_BG = "#2e2e2e"
@@ -3367,7 +3901,10 @@ class tapoStreamer:
             canvas.itemconfig(canvas_win, width=canvas.winfo_width())
             _bind_scroll(rows_frame)
 
-        _render_rows(events)
+        _refresh_filter_options(events)
+        _render_rows(_filtered_events())
+
+        filter_combo.bind("<<ComboboxSelected>>", lambda e: _render_rows(_filtered_events()))
 
         # ---- Day navigation wiring ----
         def _navigate(delta):
@@ -3379,7 +3916,8 @@ class tapoStreamer:
             state["events"] = self._load_or_scan_events(new_date)
             day_label_var.set(new_date.strftime("%A, %d %b %Y"))
             next_btn.configure(state="normal" if new_date < _date.today() else "disabled")
-            _render_rows(state["events"])
+            _refresh_filter_options(state["events"])
+            _render_rows(_filtered_events())
 
         prev_btn.configure(command=lambda: _navigate(-1))
         next_btn.configure(command=lambda: _navigate(+1))
@@ -3656,13 +4194,6 @@ class tapoStreamer:
             )
             self.rewind_buttons[index].image = rewind_img
 
-            self.current_archive_path[index] = video_path
-            self.exit_buttons[index].place(relx=0.0, rely=0.0, x=20, y=4, anchor="nw")
-            self.rewind_buttons[index].place(relx=0.0, rely=0.0, x=60, y=4, anchor="nw")
-            self.pause_buttons[index].place(relx=0.0, rely=0.0, x=100, y=4, anchor="nw")
-            self.speed_buttons[index].place(relx=0.0, rely=0.0, x=140, y=4, anchor="nw")
-            self.replay_buttons[index].place(relx=0.0, rely=0.0, x=180, y=4, anchor="nw")
-
             # Audio toggle button — starts unmuted for archive mode; event
             # mode overrides this via archive_audio_muted before calling here.
             self.archive_audio_muted[index] = False
@@ -3676,10 +4207,12 @@ class tapoStreamer:
                 command=lambda idx=index: self.toggle_archive_audio(idx)
             )
             self.audio_buttons[index].image = audio_img
-            self.audio_buttons[index].place(relx=0.0, rely=0.0, x=220, y=4, anchor="nw")
 
+            self.current_archive_path[index] = video_path
+            # Buttons start hidden; the hover-poll loop will place/forget them
+            # as the cursor enters/leaves the quadrant.
             self.labels[index].update_idletasks()
-            logging.info(f"Stream {index}: Buttons placed for video {video_path}")
+            logging.info(f"Stream {index}: Buttons created for video {video_path}")
         except Exception as e:
             logging.error(f"Stream {index}: Failed to create or place buttons: {e}")
             self.labels[index].configure(image="", text="Button Creation Failed", fg="white")
@@ -3759,6 +4292,7 @@ class tapoStreamer:
                                 except Exception as e:
                                     logging.warning(f"Stream {index}: Failed to seek to saved position: {e}")
                     threading.Thread(target=self.monitor_vlc_playback, args=(index,), daemon=True).start()
+                    self.root.after(0, lambda i=index: self._start_hover_poll(i))
                     logging.info(f"Stream {index}: Started python-vlc playback for archive video")
                     break
                 time.sleep(0.1)
@@ -3958,16 +4492,13 @@ class tapoStreamer:
 
     def start_ptz_move(self, direction):
         if not self.is_fullscreen or self.fullscreen_index is None or not self.streams[self.fullscreen_index]:
-            logging.debug("PTZ move ignored: Not in fullscreen or no stream")
             return
         ip = self.ips[self.fullscreen_index]
         if not ip or self.ptz_busy:
-            logging.debug(f"PTZ move ignored: IP={ip}, ptz_busy={self.ptz_busy}")
             return
         
         with self.ptz_lock:
             if self.ptz_buttons_disabled:
-                logging.debug("PTZ move ignored: Buttons are disabled")
                 return
             self.ptz_busy = True
             self.ptz_moving = True
@@ -3981,10 +4512,8 @@ class tapoStreamer:
 
     def stop_ptz_move(self, direction):
         if not self.is_fullscreen or self.fullscreen_index is None:
-            logging.debug("Stop PTZ ignored: Not in fullscreen")
             return
         self.ptz_moving = False
-        logging.debug(f"PTZ move stop requested for direction={direction}")
 
     def disable_ptz_buttons(self):
         """Disable all PTZ buttons on the main thread."""
@@ -3993,7 +4522,6 @@ class tapoStreamer:
             self.root.after(0, lambda: [
                 button.config(state="disabled") for button in self.ptz_buttons
             ])
-            logging.debug("PTZ buttons disabled")
 
     def enable_ptz_buttons(self):
         """Enable all PTZ buttons on the main thread."""
@@ -4002,7 +4530,6 @@ class tapoStreamer:
             self.root.after(0, lambda: [
                 button.config(state="normal") for button in self.ptz_buttons
             ])
-            logging.debug("PTZ buttons enabled")
 
     def ptz_move_loop(self, direction, ip):
         try:
@@ -4022,10 +4549,8 @@ class tapoStreamer:
                 # Send stop command (or pulse_stop for left/right)
                 if direction in ["left", "right"]:
                     self.send_ptz_command(ip, "pulse_stop")
-                    logging.debug("Sent pulse_stop command")
                 else:
                     self.send_ptz_command(ip, "stop")
-                    logging.debug("Sent stop command")
                 
                 # Get ONVIF camera for status polling
                 cam_info = self.get_onvif_camera(ip)
@@ -4048,7 +4573,6 @@ class tapoStreamer:
                     try:
                         status = ptz.GetStatus({"ProfileToken": token})
                         move_status = status.MoveStatus.PanTilt if hasattr(status.MoveStatus, 'PanTilt') else "UNKNOWN"
-                        logging.debug(f"PTZ status after stop for ip={ip}: {move_status}")
                         if move_status == "IDLE":
                             logging.info(f"Confirmed PTZ idle for ip={ip} after {time.time() - start_time:.2f} seconds")
                             break
@@ -4065,7 +4589,6 @@ class tapoStreamer:
             self.ptz_moving = False
             self.ptz_busy = False
             self.enable_ptz_buttons()
-            logging.debug(f"PTZ move loop finished for ip={ip}, direction={direction}")
 
     def send_ptz_command(self, ip, command):
         cam_info = self.get_onvif_camera(ip)
@@ -4077,7 +4600,6 @@ class tapoStreamer:
             token = cam_info["token"]
             if command == "stop":
                 ptz.Stop({"ProfileToken": token})
-                logging.debug(f"Sent PTZ stop command to ip={ip}")
             elif command == "pulse_stop":
                 request = ptz.create_type("ContinuousMove")
                 request.ProfileToken = token
@@ -4086,7 +4608,6 @@ class tapoStreamer:
                 ptz.ContinuousMove(request)
                 time.sleep(0.1)
                 ptz.Stop({"ProfileToken": token})
-                logging.debug(f"Sent PTZ pulse_stop command to ip={ip}, y_velocity={y_velocity}")
             else:
                 request = ptz.create_type("ContinuousMove")
                 request.ProfileToken = token
@@ -4118,7 +4639,6 @@ class tapoStreamer:
             if size.lower() == "fullscreen":
                 self.root.attributes("-fullscreen", True)
                 self.root.update_idletasks()
-                logging.debug("Set window to fullscreen mode")
             else:
                 # Parse width and height from size string (e.g., '1340x720')
                 try:
@@ -4137,7 +4657,6 @@ class tapoStreamer:
                 self.root.attributes("-fullscreen", False)
                 self.root.geometry(f"{width}x{height}")
                 self.center_window(width, height)
-                logging.debug(f"Set window size to {width}x{height} and centered")
         except Exception as e:
             logging.error(f"Failed to apply window size {size}: {e}", exc_info=True)
             # Fallback to default size
@@ -4146,7 +4665,6 @@ class tapoStreamer:
             self.force_unmaximize(width, height)
             self.root.geometry(f"{width}x{height}")
             self.center_window(width, height)
-            logging.debug(f"Fallback to default size {width}x{height} and centered")
 
     def center_window(self, width, height):
         try:
@@ -4161,7 +4679,6 @@ class tapoStreamer:
                 y = (available_height - height) // 2
                 if y < 0:
                     y = 0
-                    logging.debug("Adjusted y to 0 to avoid negative position")
             else:
                 # Use full screen height (Linux or Windows detection failure)
                 x = (screen_width - width) // 2
@@ -4173,13 +4690,11 @@ class tapoStreamer:
 
             self.root.geometry(f"{width}x{height}+{x}+{y}")
             self.root.update_idletasks()
-            logging.debug(f"Centered window at {width}x{height}+{x}+{y}, taskbar height: {taskbar_height}px")
         except Exception as e:
             logging.error(f"Failed to center window: {e}", exc_info=True)
             # Fallback to default positioning
             self.root.geometry(f"{width}x{height}+0+0")
             self.root.update_idletasks()
-            logging.debug(f"Fallback to position {width}x{height}+0+0")
 
     def clamp_size(self, width, height):
         screen_width = self.root.winfo_screenwidth() - 50  # Margin for panels/docks
@@ -4220,13 +4735,11 @@ class tapoStreamer:
                 work_area_height = rect.bottom - rect.top
                 taskbar_height = screen_height - work_area_height
                 if taskbar_height > 0 and taskbar_height < screen_height // 2:  # Sanity check
-                    logging.debug(f"Detected Windows taskbar height: {taskbar_height}px")
                     return taskbar_height
-                logging.debug(f"Invalid Windows taskbar height: {taskbar_height}px")
-            except Exception as e:
-                logging.debug(f"Failed to detect Windows taskbar height: {e}")
+            except Exception:
+                pass
         else:
-            logging.debug("Linux detected, using full screen height for centering")
+            pass
         return 0
 
     def cleanup_archive_mode(self, index):
@@ -4264,7 +4777,6 @@ class tapoStreamer:
             logging.error(f"Stream {index}: Failed to clean up archive mode: {e}")
 
     def cleanup_config_panel(self):
-        logging.debug("Cleaning up config panel")
         try:
             if self.config_panel:
                 self.config_panel.destroy()
@@ -4296,9 +4808,8 @@ class tapoStreamer:
                 if self.fullscreen_buttons[i]:
                     self.fullscreen_buttons[i].destroy()
                     self.fullscreen_buttons[i] = None
-            logging.debug("Config panel cleaned up successfully")
-        except Exception as e:
-            logging.debug(f"Error cleaning up config panel: {e}")
+        except Exception:
+            pass
 
 
     def cleanup(self):
@@ -4384,10 +4895,6 @@ class tapoStreamer:
         _threading.Thread(target=_vlc_teardown, daemon=True).start()
 
 if __name__ == "__main__":
-    try:
-        import ttkbootstrap as tb
-        root = tb.Window(themename="darkly")
-    except ImportError:
-        root = tk.Tk()
+    root = tk.Tk()
     app = tapoStreamer(root)
     root.mainloop()
