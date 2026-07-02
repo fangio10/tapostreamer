@@ -79,9 +79,6 @@ class tapoStreamer:
             logging.error(f"Failed to parse VLC parameters '{raw}': {e}", exc_info=True)
             return default
 
-    VK_LBUTTON = 0x01
-    VK_RBUTTON = 0x02
-
     MIN_WIDTH = 1340
     MIN_HEIGHT = 720
     FONT_CANDIDATES = ["Verdana", "Tahoma", "Arial", "Segoe UI", "DejaVu Sans", "Liberation Sans", "Noto Sans"]
@@ -322,11 +319,14 @@ class tapoStreamer:
         self.archive_audio_muted = [True] * 4
         self.event_mode = False
 
-        # Hover/click polling state for clip-playback controls (used because
-        # the embedded VLC HWND swallows Tk mouse events on Windows).
+        # Hover polling state for clip-playback controls. On Windows the
+        # embedded VLC HWND swallows Tk <Enter>/<Leave> events, so cursor
+        # position is polled to know when to show/hide the clip control
+        # strip for a given quadrant. This is display-only - no click
+        # emulation is done here; all actions (fullscreen, exit, back,
+        # events) use real Tk buttons/bindings, which already work
+        # correctly on both platforms.
         self._hover_poll_ids = [None] * 4
-        self._prev_left_down = [False] * 4
-        self._prev_right_down = [False] * 4
         self._clip_controls_visible = [False] * 4
 
         self.event_clip_queues = [[] for _ in range(4)]
@@ -701,6 +701,14 @@ class tapoStreamer:
             logging.info(f"Config file {self.config_file} does not exist. Creating with default settings.")
             self.save_config()
 
+        # Windows: real Tk buttons (fullscreen icon, exit-fullscreen,
+        # per-clip exit, events) are the workaround for the embedded VLC
+        # HWND swallowing native Tk mouse events - always force this on
+        # rather than relying on GetAsyncKeyState-based click polling to
+        # fake the missing clicks. Overrides any saved config value.
+        if sys.platform.startswith('win'):
+            self.enable_fullscreen_buttons = True
+
     def save_config(self):
         config = {
             "username": self.username,
@@ -929,9 +937,17 @@ class tapoStreamer:
         row = add_section_header(core_frame, "Behavior", row)
 
         fullscreen_buttons_var = tk.BooleanVar(value=self.enable_fullscreen_buttons)
-        ttk.Checkbutton(core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var).grid(
-            row=row, column=0, **SPAN
+        fullscreen_buttons_cb = ttk.Checkbutton(
+            core_frame, text="Show Stream Buttons", variable=fullscreen_buttons_var
         )
+        fullscreen_buttons_cb.grid(row=row, column=0, **SPAN)
+        if sys.platform.startswith('win'):
+            fullscreen_buttons_var.set(True)
+            fullscreen_buttons_cb.configure(state="disabled")
+            tk.Label(
+                core_frame, text="Required on Windows",
+                font=self.app_font(9), fg="#888888"
+            ).grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
         row += 1
 
         resume_playback_var = tk.BooleanVar(value=self.resume_playback)
@@ -1965,10 +1981,6 @@ class tapoStreamer:
                     logging.info(f"Stream {index}: Initialized successfully")
                     self.set_audio_state(index, mute=True)
                     self.root.after(0, lambda idx=index: self.bind_stream_label(idx))
-                    # Windows + fullscreen buttons disabled: poll for left/right
-                    # click over the embedded HWND (native Tk events are swallowed).
-                    if sys.platform.startswith('win') and not self.enable_fullscreen_buttons:
-                        self.root.after(0, lambda idx=index: self._start_live_click_poll(idx))
                     return True
 
                 if self.stream_cleanup_events[index].is_set():
@@ -3057,17 +3069,6 @@ class tapoStreamer:
         self.audio_buttons[index]  = None
         self.video_ended[index]    = False
 
-    def _is_button_down(self, vk):
-        """Poll OS-level mouse button state. Only meaningful on Windows -
-        Linux relies on native Tk click events, which work fine over the
-        embedded video surface there."""
-        if not sys.platform.startswith('win'):
-            return False
-        try:
-            return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
-        except Exception:
-            return False
-
     def _clip_control_widgets(self, index):
         return [
             self.exit_buttons[index],
@@ -3141,7 +3142,7 @@ class tapoStreamer:
                     widget.place_forget()
 
     def _stop_hover_poll(self, index):
-        """Cancel the hover/click poll loop for a stream, if running."""
+        """Cancel the hover poll loop for a stream, if running."""
         poll_id = self._hover_poll_ids[index]
         if poll_id:
             try:
@@ -3150,40 +3151,20 @@ class tapoStreamer:
                 pass
             self._hover_poll_ids[index] = None
         self._clip_controls_visible[index] = False
-        self._prev_left_down[index] = False
-        self._prev_right_down[index] = False
-
-    def _win_app_is_foreground(self):
-        """Return True if the foreground window belongs to our process.
-        More reliable than Tk's focus_displayof() which returns None whenever
-        an embedded native HWND (e.g. VLC) holds Win32 keyboard focus.
-        Checks process ownership rather than exact HWND match so dialogs,
-        embedded VLC windows, and child windows all count as 'ours'."""
-        if not sys.platform.startswith('win'):
-            return True
-        try:
-            fg = ctypes.windll.user32.GetForegroundWindow()
-            if fg == 0:
-                return False
-            pid = ctypes.c_ulong(0)
-            ctypes.windll.user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
-            return pid.value == os.getpid()
-        except Exception:
-            return True
 
     def _start_hover_poll(self, index):
-        """Poll pointer position to drive clip-control visibility, and on
-        Windows poll button state for right-click → go_back.  Left-click
-        has no action here; the pause button in the control strip handles
-        pausing.
+        """Poll pointer position to drive clip-control visibility for a
+        clip-playback quadrant. Display-only: no click emulation happens
+        here. On Windows the embedded VLC HWND swallows Tk <Enter>/<Leave>
+        events, so cursor position has to be polled to know when to show or
+        hide the control strip; on Linux native Tk hover events would work
+        fine, but the same poll is used on both platforms for simplicity
+        since it's just visibility, not action.
 
-        On Linux, X11 delivers clicks normally so we just bind right-click
-        directly and use the poll only for hover-based visibility."""
+        All actual clip actions (exit/back, pause, speed, replay, rewind,
+        audio) are real Tk buttons in the control strip this shows/hides -
+        no click polling or emulation is needed for them on either OS."""
         self._stop_hover_poll(index)
-
-        # Linux: the root-level <Button-3> binding fires exit_fullscreen, which
-        # already calls go_back when in archive mode, so no extra bind is needed
-        # here.  We do clear any stale bindings from a previous clip session.
 
         def poll():
             if not self.running or not self.media_players[index]:
@@ -3203,78 +3184,8 @@ class tapoStreamer:
 
             self._set_clip_controls_visible(index, inside)
 
-            # Windows only: right-click → go_back (or exit_fullscreen in
-            # event mode, which has its own intercept to stop all clips and
-            # re-show the event overlay — matching the Linux root-binding
-            # behaviour that the HWND swallows during clip playback).
-            if (sys.platform.startswith('win') and inside
-                    and self._win_app_is_foreground()):
-                right_down = self._is_button_down(self.VK_RBUTTON)
-                if self._prev_right_down[index] and not right_down:
-                    self._prev_right_down[index] = False
-                    if self.event_mode:
-                        self.exit_fullscreen()
-                    else:
-                        self.go_back(index)
-                    return  # Don't reschedule — action taken, state may be torn down
-                self._prev_right_down[index] = right_down
-            elif not inside:
-                self._prev_right_down[index] = False
-
             interval = 60 if sys.platform.startswith('win') else 150
             self._hover_poll_ids[index] = self.root.after(interval, poll)
-
-        poll()
-
-    def _start_live_click_poll(self, index):
-        """Windows-only poll for live (non-archive) streams when fullscreen
-        buttons are disabled.  Replicates the left/right click behaviour that
-        native Tk bindings provide on Linux but that the embedded VLC HWND
-        swallows on Windows:
-            left-click  → handle_stream_click  (enter/exit fullscreen)
-            right-click → exit_fullscreen       (back to grid)
-
-        Shares _hover_poll_ids[index] with _start_hover_poll — the two are
-        mutually exclusive per stream (live vs clip-playback)."""
-        if not sys.platform.startswith('win'):
-            return  # Linux handles this via native Tk bindings
-        self._stop_hover_poll(index)
-
-        def poll():
-            # Stop if the stream has gone away or we've entered clip playback.
-            if not self.running or self.is_archive_mode[index]:
-                self._hover_poll_ids[index] = None
-                return
-
-            if self._win_app_is_foreground():
-                try:
-                    px, py = self.root.winfo_pointerxy()
-                    label = self.labels[index]
-                    x0 = label.winfo_rootx()
-                    y0 = label.winfo_rooty()
-                    inside = (x0 <= px <= x0 + label.winfo_width() and
-                              y0 <= py <= y0 + label.winfo_height())
-                except Exception:
-                    inside = False
-
-                if inside:
-                    left_down  = self._is_button_down(self.VK_LBUTTON)
-                    right_down = self._is_button_down(self.VK_RBUTTON)
-                    if self._prev_left_down[index] and not left_down:
-                        self._prev_left_down[index] = False
-                        self.handle_stream_click(index)
-                        return  # Don't reschedule — state may have changed
-                    if self._prev_right_down[index] and not right_down:
-                        self._prev_right_down[index] = False
-                        self.exit_fullscreen()
-                        return  # Don't reschedule — state may have changed
-                    self._prev_left_down[index] = left_down
-                    self._prev_right_down[index] = right_down
-                else:
-                    self._prev_left_down[index] = False
-                    self._prev_right_down[index] = False
-
-            self._hover_poll_ids[index] = self.root.after(60, poll)
 
         poll()
 
@@ -3926,8 +3837,10 @@ class tapoStreamer:
         # Show the panel
         _place_overlay()
 
-    def _event_transfer_audio(self, index):
-        # Transfer audio to cam index during event playback.
+    def _transfer_archive_audio(self, index):
+        # Give audio exclusively to index (archive or event clip playback) -
+        # mutes every other currently-unmuted archive/event stream first,
+        # matching "most recently started clip gets audio" behaviour.
 
         if not self.exclusive_archive_audio:
             return
@@ -4036,16 +3949,12 @@ class tapoStreamer:
 
         for ci, first_path, delay_ms in cam_launches:
             if delay_ms == 0:
-                self._event_transfer_audio(ci)
                 self.play_archive_video(ci, first_path)
             else:
                 logging.info(f"Cam {ci + 1}: delaying event playback start by {delay_ms}ms")
                 _after_id = self.root.after(
                     delay_ms,
-                    lambda c=ci, p=first_path: (
-                        self._event_transfer_audio(c),
-                        self.play_archive_video(c, p)
-                    )
+                    lambda c=ci, p=first_path: self.play_archive_video(c, p)
                 )
                 self._pending_event_afters.append(_after_id)
               
@@ -4069,14 +3978,10 @@ class tapoStreamer:
                 self.labels[index].configure(image="", text=f"Cam {index + 1}", fg="#888888", bg="black")
                 _after_id = self.root.after(
                     adjusted_gap_ms,
-                    lambda i=index, p=next_path: (
-                        self._event_transfer_audio(i),
-                        self.play_archive_video(i, p)
-                    )
+                    lambda i=index, p=next_path: self.play_archive_video(i, p)
                 )
                 self._pending_event_afters.append(_after_id)
             else:
-                self._event_transfer_audio(index)
                 self.play_archive_video(index, next_path)
         else:
             # This cam's clips are all done — black it out
@@ -4194,9 +4099,11 @@ class tapoStreamer:
             )
             self.rewind_buttons[index].image = rewind_img
 
-            # Audio toggle button — starts unmuted for archive mode; event
-            # mode overrides this via archive_audio_muted before calling here.
-            self.archive_audio_muted[index] = False
+            # Audio toggle button. Starting this clip transfers audio to it
+            # exclusively (muting any other currently-playing archive/event
+            # clip) - same "most recently started clip gets audio" behaviour
+            # in both archive browsing and event playback.
+            self._transfer_archive_audio(index)
             audio_img = self.icon_cache["audio_on"]
             self.audio_buttons[index] = tk.Button(
                 self.labels[index],
@@ -4324,7 +4231,6 @@ class tapoStreamer:
             try:
                 self.media_players[index].pause()
                 self.media_players[index].set_rate(1.0)
-                self.set_audio_state(index, mute=False)
                 logging.info(f"Stream {index} {'paused' if self.is_paused[index] else 'resumed'} at 1x speed")
             except Exception as e:
                 logging.error(f"Error toggling pause for stream {index}: {e}")
@@ -4376,7 +4282,6 @@ class tapoStreamer:
                 new_time = max(0, current_time - 10000)
                 self.media_players[index].set_time(new_time)
                 self.media_players[index].set_rate(1.0)
-                self.set_audio_state(index, mute=False)
                 if self.is_paused[index]:
                     self.media_players[index].play()
                     self.is_paused[index] = False
@@ -4401,7 +4306,6 @@ class tapoStreamer:
             try:
                 self.media_players[index].set_time(0)
                 self.media_players[index].set_rate(1.0)
-                self.set_audio_state(index, mute=False)
                 if self.is_paused[index]:
                     self.media_players[index].play()
                     self.is_paused[index] = False
@@ -4424,7 +4328,6 @@ class tapoStreamer:
         if self.media_players[index]:
             try:
                 self.media_players[index].set_rate(next_speed)
-                self.set_audio_state(index, mute=False)
                 logging.info(f"Stream {index} playback speed set to x{next_speed}")
             except Exception as e:
                 logging.error(f"Error setting playback speed for stream {index}: {e}")
